@@ -65,10 +65,16 @@ These guide tools include docs text from the OpenAPI documentation, explicit pur
 This server enforces a docs-first workflow for endpoint execution:
 
 1. Call `guide_<operation_id>` first for the endpoint you want to execute.
-2. That unlocks the execution tool for **30 minutes** in the current MCP session.
-3. Then call the endpoint tool itself (for example `create_server`).
+2. Then call the endpoint tool itself (for example `create_server`).
 
 If you skip step 1, execution is rejected with a `docs_required` error.
+
+Unlocking is based on **context freshness** (interaction distance in the current session),
+not wall-clock time:
+
+- Docs must be read before execution.
+- Recently executed endpoints remain trusted while context is still fresh.
+- After enough unrelated tool interactions (context drift), docs must be read again.
 
 ## Full Coverage
 

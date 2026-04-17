@@ -26,7 +26,25 @@ logger = logging.getLogger(__name__)
 
 GUIDE_PREFIX = "guide_"
 CATEGORY_GUIDE_PREFIX = "category_guide_"
-DOCS_LOCK_SECONDS = 30 * 60
+DOCS_TO_EXEC_MAX_INTERACTIONS = 40
+EXECUTION_RELEVANCE_MAX_INTERACTIONS = 120
+
+
+@dataclass(slots=True)
+class OperationUsageState:
+    """Usage-tracking state for one operation within one session."""
+
+    last_docs_event: int | None = None
+    last_execute_event: int | None = None
+    execute_count: int = 0
+
+
+@dataclass(slots=True)
+class SessionUsageState:
+    """Per-session usage tracking for docs-first policy."""
+
+    event_counter: int = 0
+    operations: dict[str, OperationUsageState] = field(default_factory=dict)
 
 
 def _configure_logging() -> None:
@@ -42,7 +60,7 @@ class HetznerMCPApplication:
 
     registry: OperationRegistry
     client: HetznerHttpClient
-    docs_locks: dict[str, dict[str, float]] = field(default_factory=dict)
+    session_usage: dict[str, SessionUsageState] = field(default_factory=dict)
 
     def list_tools(self) -> list[types.Tool]:
         """Build helper + dynamic operation tools."""
@@ -208,6 +226,9 @@ class HetznerMCPApplication:
         session_key: str | None = None,
     ) -> types.CallToolResult:
         """Handle helper tools and dynamic operation tools."""
+        normalized_session = self._normalize_session_key(session_key)
+        event_id = self._next_session_event(normalized_session)
+
         try:
             if name == "list_api_operations":
                 payload = self._helper_list_operations(arguments)
@@ -216,9 +237,10 @@ class HetznerMCPApplication:
                 payload = self._helper_get_operation_details(arguments)
                 operation_id = payload.get("operation_id")
                 if isinstance(operation_id, str):
-                    payload["docs_lock"] = self._grant_docs_lock(
-                        session_key=session_key,
+                    payload["docs_policy"] = self._mark_docs_seen(
+                        session_key=normalized_session,
                         operation_id=operation_id,
+                        event_id=event_id,
                     )
                 return _success_result(payload)
             if name == "search_api_operations":
@@ -238,9 +260,10 @@ class HetznerMCPApplication:
                 operation_id = name[len(GUIDE_PREFIX) :]
                 operation = self.registry.get(operation_id)
                 payload = self._build_operation_guide(operation)
-                payload["docs_lock"] = self._grant_docs_lock(
-                    session_key=session_key,
+                payload["docs_policy"] = self._mark_docs_seen(
+                    session_key=normalized_session,
                     operation_id=operation.operation_id,
+                    event_id=event_id,
                 )
                 return _success_result(payload)
 
@@ -250,10 +273,18 @@ class HetznerMCPApplication:
 
             operation = self.registry.get(name)
             self._assert_operation_unlocked(
-                session_key=session_key,
+                session_key=normalized_session,
                 operation_id=operation.operation_id,
+                event_id=event_id,
             )
-            return await self._execute_operation(operation=operation, arguments=arguments)
+            result = await self._execute_operation(operation=operation, arguments=arguments)
+            if not result.isError:
+                self._mark_operation_executed(
+                    session_key=normalized_session,
+                    operation_id=operation.operation_id,
+                    event_id=event_id,
+                )
+            return result
         except HetznerMCPError as exc:
             return _error_result(exc.to_dict())
         except Exception as exc:  # pragma: no cover
@@ -484,59 +515,85 @@ class HetznerMCPApplication:
             ],
         }
 
-    def _grant_docs_lock(self, *, session_key: str | None, operation_id: str) -> dict[str, Any]:
-        normalized_session = self._normalize_session_key(session_key)
-        now = time.monotonic()
-        expires_at = now + DOCS_LOCK_SECONDS
-
-        session_locks = self.docs_locks.setdefault(normalized_session, {})
-        session_locks[operation_id] = expires_at
-        self._cleanup_expired_locks(normalized_session)
+    def _mark_docs_seen(
+        self, *, session_key: str, operation_id: str, event_id: int
+    ) -> dict[str, Any]:
+        operation_state = self._get_or_create_operation_state(session_key, operation_id)
+        operation_state.last_docs_event = event_id
 
         return {
             "required": True,
-            "lock_seconds": DOCS_LOCK_SECONDS,
-            "expires_in_seconds": DOCS_LOCK_SECONDS,
+            "policy": "context_usage",
             "operation_id": operation_id,
-            "session_scope": normalized_session,
+            "session_scope": session_key,
+            "granted_at_event": event_id,
+            "docs_to_execute_max_interactions": DOCS_TO_EXEC_MAX_INTERACTIONS,
+            "execution_relevance_max_interactions": EXECUTION_RELEVANCE_MAX_INTERACTIONS,
             "message": (
-                "Endpoint unlocked for 30 minutes in this session. You can now call the "
-                "execution tool."
+                "Endpoint docs acknowledged. Execution is allowed while context remains fresh "
+                "based on interaction distance, not wall-clock time."
             ),
         }
 
-    def _assert_operation_unlocked(self, *, session_key: str | None, operation_id: str) -> None:
-        normalized_session = self._normalize_session_key(session_key)
-        self._cleanup_expired_locks(normalized_session)
+    def _mark_operation_executed(
+        self, *, session_key: str, operation_id: str, event_id: int
+    ) -> None:
+        operation_state = self._get_or_create_operation_state(session_key, operation_id)
+        operation_state.last_execute_event = event_id
+        operation_state.execute_count += 1
 
-        session_locks = self.docs_locks.get(normalized_session, {})
-        expires_at = session_locks.get(operation_id)
-        now = time.monotonic()
-        if expires_at is None or expires_at <= now:
-            guide_tool = f"{GUIDE_PREFIX}{operation_id}"
-            raise ValidationError(
-                code="docs_required",
-                message=(
-                    "Docs-first policy: call the endpoint guide tool before executing this "
-                    f"endpoint. Required guide tool: {guide_tool}. "
-                    "After calling docs, execution is unlocked for "
-                    f"{DOCS_LOCK_SECONDS // 60} minutes "
-                    "in this session."
-                ),
-            )
+    def _assert_operation_unlocked(
+        self,
+        *,
+        session_key: str,
+        operation_id: str,
+        event_id: int,
+    ) -> None:
+        operation_state = self._get_or_create_operation_state(session_key, operation_id)
+        guide_tool = f"{GUIDE_PREFIX}{operation_id}"
 
-    def _cleanup_expired_locks(self, session_key: str) -> None:
-        session_locks = self.docs_locks.get(session_key)
-        if not session_locks:
-            return
-        now = time.monotonic()
-        expired_ids = [
-            operation_id for operation_id, expires_at in session_locks.items() if expires_at <= now
-        ]
-        for operation_id in expired_ids:
-            session_locks.pop(operation_id, None)
-        if not session_locks:
-            self.docs_locks.pop(session_key, None)
+        if operation_state.execute_count > 0 and operation_state.last_execute_event is not None:
+            gap_since_execute = event_id - operation_state.last_execute_event
+            if gap_since_execute <= EXECUTION_RELEVANCE_MAX_INTERACTIONS:
+                return
+
+        if operation_state.last_docs_event is not None:
+            gap_since_docs = event_id - operation_state.last_docs_event
+            if gap_since_docs <= DOCS_TO_EXEC_MAX_INTERACTIONS:
+                return
+
+        raise ValidationError(
+            code="docs_required",
+            message=(
+                "Docs-first policy: call the endpoint guide tool before executing this endpoint. "
+                f"Required guide tool: {guide_tool}. "
+                "Unlock factor is interaction distance (context freshness), not time."
+            ),
+            details={
+                "operation_id": operation_id,
+                "session_scope": session_key,
+                "docs_to_execute_max_interactions": DOCS_TO_EXEC_MAX_INTERACTIONS,
+                "execution_relevance_max_interactions": EXECUTION_RELEVANCE_MAX_INTERACTIONS,
+                "last_docs_event": operation_state.last_docs_event,
+                "last_execute_event": operation_state.last_execute_event,
+                "execute_count": operation_state.execute_count,
+                "current_event": event_id,
+                "required_guide_tool": guide_tool,
+            },
+        )
+
+    def _next_session_event(self, session_key: str) -> int:
+        session_state = self.session_usage.setdefault(session_key, SessionUsageState())
+        session_state.event_counter += 1
+        return session_state.event_counter
+
+    def _get_or_create_operation_state(
+        self,
+        session_key: str,
+        operation_id: str,
+    ) -> OperationUsageState:
+        session_state = self.session_usage.setdefault(session_key, SessionUsageState())
+        return session_state.operations.setdefault(operation_id, OperationUsageState())
 
     def _normalize_session_key(self, session_key: str | None) -> str:
         return session_key or "global"
@@ -959,7 +1016,7 @@ def create_server(*, refresh_specs: bool = False) -> Server[Any]:
             "Use list_api_operations/search_api_operations to discover operations, "
             "then call operation tools directly by operationId. "
             "Docs-first policy is enforced: for each endpoint, call guide_<operationId> "
-            "first to unlock execution for 30 minutes in this session. "
+            "first to unlock execution based on context freshness (interaction distance). "
             "Use guide_<operationId> and category_guide_<domain>_<slug> tools for detailed "
             "docs-based explanations."
         ),

@@ -6,7 +6,11 @@ from typing import Any
 
 from hetzner_mcp.models import HttpResult
 from hetzner_mcp.registry import OperationRegistry
-from hetzner_mcp.server import HetznerMCPApplication
+from hetzner_mcp.server import (
+    DOCS_TO_EXEC_MAX_INTERACTIONS,
+    EXECUTION_RELEVANCE_MAX_INTERACTIONS,
+    HetznerMCPApplication,
+)
 
 
 @dataclass
@@ -157,6 +161,124 @@ def test_docs_unlock_is_session_scoped() -> None:
     assert blocked_other_session.isError is True
     assert blocked_other_session.structuredContent is not None
     assert blocked_other_session.structuredContent["error"]["code"] == "docs_required"
+
+
+def test_docs_unlock_expires_by_interaction_distance_before_first_execution() -> None:
+    app = _app()
+
+    unlock = asyncio.run(
+        app.call_tool(
+            name="guide_get_action",
+            arguments={},
+            session_key="session-a",
+        )
+    )
+    assert unlock.isError is False
+
+    for _ in range(DOCS_TO_EXEC_MAX_INTERACTIONS + 1):
+        noop = asyncio.run(
+            app.call_tool(
+                name="list_api_operations",
+                arguments={"limit": 1},
+                session_key="session-a",
+            )
+        )
+        assert noop.isError is False
+
+    blocked = asyncio.run(
+        app.call_tool(
+            name="get_action",
+            arguments={"path": {"id": 123}},
+            session_key="session-a",
+        )
+    )
+    assert blocked.isError is True
+    assert blocked.structuredContent is not None
+    assert blocked.structuredContent["error"]["code"] == "docs_required"
+
+
+def test_recent_execution_keeps_endpoint_unlocked_without_reread() -> None:
+    app = _app()
+
+    unlock = asyncio.run(
+        app.call_tool(
+            name="guide_get_action",
+            arguments={},
+            session_key="session-a",
+        )
+    )
+    assert unlock.isError is False
+
+    first_exec = asyncio.run(
+        app.call_tool(
+            name="get_action",
+            arguments={"path": {"id": 123}},
+            session_key="session-a",
+        )
+    )
+    assert first_exec.isError is False
+
+    for _ in range(EXECUTION_RELEVANCE_MAX_INTERACTIONS - 2):
+        noop = asyncio.run(
+            app.call_tool(
+                name="list_api_operations",
+                arguments={"limit": 1},
+                session_key="session-a",
+            )
+        )
+        assert noop.isError is False
+
+    second_exec = asyncio.run(
+        app.call_tool(
+            name="get_action",
+            arguments={"path": {"id": 123}},
+            session_key="session-a",
+        )
+    )
+    assert second_exec.isError is False
+
+
+def test_stale_execution_requires_reread_after_context_drift() -> None:
+    app = _app()
+
+    unlock = asyncio.run(
+        app.call_tool(
+            name="guide_get_action",
+            arguments={},
+            session_key="session-a",
+        )
+    )
+    assert unlock.isError is False
+
+    first_exec = asyncio.run(
+        app.call_tool(
+            name="get_action",
+            arguments={"path": {"id": 123}},
+            session_key="session-a",
+        )
+    )
+    assert first_exec.isError is False
+
+    for _ in range(EXECUTION_RELEVANCE_MAX_INTERACTIONS + 1):
+        noop = asyncio.run(
+            app.call_tool(
+                name="list_api_operations",
+                arguments={"limit": 1},
+                session_key="session-a",
+            )
+        )
+        assert noop.isError is False
+
+    blocked = asyncio.run(
+        app.call_tool(
+            name="get_action",
+            arguments={"path": {"id": 123}},
+            session_key="session-a",
+        )
+    )
+    assert blocked.isError is True
+    assert blocked.structuredContent is not None
+    assert blocked.structuredContent["error"]["code"] == "docs_required"
 
 
 def test_endpoint_guide_tool_returns_detailed_docs_payload() -> None:
