@@ -79,8 +79,10 @@ class OperationRegistry:
     ) -> list[OperationSpec]:
         method_normalized = method.upper() if method else None
         query_normalized = query.lower().strip() if query else None
+        query_tokens = tuple(_query_tokens(query_normalized)) if query_normalized else ()
 
         results: list[OperationSpec] = []
+        scored_results: list[tuple[int, OperationSpec]] = []
         for operation in self.all_operations():
             if api_domain and operation.api_domain != api_domain:
                 continue
@@ -89,19 +91,22 @@ class OperationRegistry:
             if method_normalized and operation.method.upper() != method_normalized:
                 continue
             if query_normalized:
-                haystack = " ".join(
-                    [
-                        operation.operation_id,
-                        operation.path,
-                        operation.display_summary,
-                        " ".join(operation.tags),
-                    ]
-                ).lower()
-                if query_normalized not in haystack:
+                score = _search_score(
+                    operation=operation, query=query_normalized, tokens=query_tokens
+                )
+                if score <= 0:
                     continue
+                scored_results.append((score, operation))
+                continue
             results.append(operation)
             if len(results) >= max(limit, 1):
                 break
+
+        if query_normalized:
+            scored_results.sort(key=lambda item: (-item[0], item[1].operation_id))
+            cap = max(limit, 1)
+            return [operation for _, operation in scored_results[:cap]]
+
         return results
 
     def counts_by_tag(self) -> dict[str, int]:
@@ -326,3 +331,68 @@ def _slugify(value: str) -> str:
     replaced = re.sub(r"[^a-z0-9]+", "_", lowered)
     normalized = re.sub(r"_+", "_", replaced).strip("_")
     return normalized or "untagged"
+
+
+def _query_tokens(query: str) -> list[str]:
+    return [token for token in re.split(r"\s+", query) if token]
+
+
+def _search_score(*, operation: OperationSpec, query: str, tokens: tuple[str, ...]) -> int:
+    operation_id = operation.operation_id.lower()
+    path = operation.path.lower()
+    method = operation.method.lower()
+    api_domain = operation.api_domain.lower()
+    primary_tag = operation.primary_tag.lower()
+    tags = " ".join(tag.lower() for tag in operation.tags)
+    summary = operation.display_summary.lower()
+    docs_text = operation.docs_text.lower()
+
+    haystack = " ".join(
+        [operation_id, path, method, api_domain, primary_tag, tags, summary, docs_text]
+    )
+    if any(token not in haystack for token in tokens):
+        return 0
+
+    score = 0
+
+    if query == operation_id:
+        score += 180
+    elif query in operation_id:
+        score += 90
+
+    if query == path:
+        score += 150
+    elif query in path:
+        score += 80
+
+    if query == method:
+        score += 120
+    if query == api_domain:
+        score += 70
+    if query == primary_tag:
+        score += 70
+
+    if query in summary:
+        score += 45
+    if query in docs_text:
+        score += 35
+    if query in tags:
+        score += 45
+
+    for token in tokens:
+        if token == method:
+            score += 35
+        if token == api_domain:
+            score += 20
+        if token in operation_id:
+            score += 22
+        if token in path:
+            score += 14
+        if token in tags:
+            score += 12
+        if token in summary:
+            score += 8
+        if token in docs_text:
+            score += 5
+
+    return score

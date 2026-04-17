@@ -34,3 +34,21 @@ def test_category_registry_contains_expected_categories() -> None:
     assert storage_boxes.name == "Storage Boxes"
     assert storage_boxes.tool_name == "category_guide_storage_storage_boxes"
     assert "create_storage_box" in storage_boxes.operation_ids
+
+
+def test_search_matches_multi_term_query_in_any_order() -> None:
+    registry = OperationRegistry.load(refresh_specs=False)
+
+    results = registry.list_filtered(query="volume create", limit=20)
+    ids = {operation.operation_id for operation in results}
+
+    assert "create_volume" in ids
+
+
+def test_search_matches_http_method_keyword() -> None:
+    registry = OperationRegistry.load(refresh_specs=False)
+
+    results = registry.list_filtered(query="post volume", limit=20)
+    ids = {operation.operation_id for operation in results}
+
+    assert "create_volume" in ids
