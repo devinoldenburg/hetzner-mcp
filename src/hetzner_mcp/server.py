@@ -8,7 +8,7 @@ import logging
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import mcp.server.stdio
@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 GUIDE_PREFIX = "guide_"
 CATEGORY_GUIDE_PREFIX = "category_guide_"
+DOCS_LOCK_SECONDS = 30 * 60
 
 
 def _configure_logging() -> None:
@@ -41,6 +42,7 @@ class HetznerMCPApplication:
 
     registry: OperationRegistry
     client: HetznerHttpClient
+    docs_locks: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def list_tools(self) -> list[types.Tool]:
         """Build helper + dynamic operation tools."""
@@ -198,7 +200,13 @@ class HetznerMCPApplication:
             )
         return tools
 
-    async def call_tool(self, name: str, arguments: dict[str, Any] | None) -> types.CallToolResult:
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None,
+        *,
+        session_key: str | None = None,
+    ) -> types.CallToolResult:
         """Handle helper tools and dynamic operation tools."""
         try:
             if name == "list_api_operations":
@@ -206,6 +214,12 @@ class HetznerMCPApplication:
                 return _success_result(payload)
             if name == "get_api_operation_details":
                 payload = self._helper_get_operation_details(arguments)
+                operation_id = payload.get("operation_id")
+                if isinstance(operation_id, str):
+                    payload["docs_lock"] = self._grant_docs_lock(
+                        session_key=session_key,
+                        operation_id=operation_id,
+                    )
                 return _success_result(payload)
             if name == "search_api_operations":
                 payload = self._helper_search_operations(arguments)
@@ -223,13 +237,22 @@ class HetznerMCPApplication:
             if name.startswith(GUIDE_PREFIX):
                 operation_id = name[len(GUIDE_PREFIX) :]
                 operation = self.registry.get(operation_id)
-                return _success_result(self._build_operation_guide(operation))
+                payload = self._build_operation_guide(operation)
+                payload["docs_lock"] = self._grant_docs_lock(
+                    session_key=session_key,
+                    operation_id=operation.operation_id,
+                )
+                return _success_result(payload)
 
             if name.startswith(CATEGORY_GUIDE_PREFIX):
                 category = self.registry.get_category_by_tool_name(name)
                 return _success_result(self._build_category_guide(category))
 
             operation = self.registry.get(name)
+            self._assert_operation_unlocked(
+                session_key=session_key,
+                operation_id=operation.operation_id,
+            )
             return await self._execute_operation(operation=operation, arguments=arguments)
         except HetznerMCPError as exc:
             return _error_result(exc.to_dict())
@@ -460,6 +483,63 @@ class HetznerMCPApplication:
                 for operation in operations
             ],
         }
+
+    def _grant_docs_lock(self, *, session_key: str | None, operation_id: str) -> dict[str, Any]:
+        normalized_session = self._normalize_session_key(session_key)
+        now = time.monotonic()
+        expires_at = now + DOCS_LOCK_SECONDS
+
+        session_locks = self.docs_locks.setdefault(normalized_session, {})
+        session_locks[operation_id] = expires_at
+        self._cleanup_expired_locks(normalized_session)
+
+        return {
+            "required": True,
+            "lock_seconds": DOCS_LOCK_SECONDS,
+            "expires_in_seconds": DOCS_LOCK_SECONDS,
+            "operation_id": operation_id,
+            "session_scope": normalized_session,
+            "message": (
+                "Endpoint unlocked for 30 minutes in this session. You can now call the "
+                "execution tool."
+            ),
+        }
+
+    def _assert_operation_unlocked(self, *, session_key: str | None, operation_id: str) -> None:
+        normalized_session = self._normalize_session_key(session_key)
+        self._cleanup_expired_locks(normalized_session)
+
+        session_locks = self.docs_locks.get(normalized_session, {})
+        expires_at = session_locks.get(operation_id)
+        now = time.monotonic()
+        if expires_at is None or expires_at <= now:
+            guide_tool = f"{GUIDE_PREFIX}{operation_id}"
+            raise ValidationError(
+                code="docs_required",
+                message=(
+                    "Docs-first policy: call the endpoint guide tool before executing this "
+                    f"endpoint. Required guide tool: {guide_tool}. "
+                    "After calling docs, execution is unlocked for "
+                    f"{DOCS_LOCK_SECONDS // 60} minutes "
+                    "in this session."
+                ),
+            )
+
+    def _cleanup_expired_locks(self, session_key: str) -> None:
+        session_locks = self.docs_locks.get(session_key)
+        if not session_locks:
+            return
+        now = time.monotonic()
+        expired_ids = [
+            operation_id for operation_id, expires_at in session_locks.items() if expires_at <= now
+        ]
+        for operation_id in expired_ids:
+            session_locks.pop(operation_id, None)
+        if not session_locks:
+            self.docs_locks.pop(session_key, None)
+
+    def _normalize_session_key(self, session_key: str | None) -> str:
+        return session_key or "global"
 
     async def _helper_wait_for_action(self, arguments: dict[str, Any] | None) -> dict[str, Any]:
         args = arguments or {}
@@ -839,6 +919,32 @@ def _error_result(payload: dict[str, Any]) -> types.CallToolResult:
     )
 
 
+def _session_key_from_server(server: Server[Any]) -> str:
+    """Create a stable in-process session key from current MCP request context."""
+    try:
+        ctx = server.request_context
+    except LookupError:
+        return "global"
+
+    session_obj = ctx.session
+    session_id = str(id(session_obj))
+
+    client_name = "unknown"
+    client_version = "unknown"
+    try:
+        client_params = session_obj.client_params
+        if client_params is not None:
+            client_info = getattr(client_params, "clientInfo", None)
+            if client_info is not None:
+                client_name = str(getattr(client_info, "name", "unknown"))
+                client_version = str(getattr(client_info, "version", "unknown"))
+    except Exception:
+        client_name = "unknown"
+        client_version = "unknown"
+
+    return f"session:{session_id}:{client_name}:{client_version}"
+
+
 def create_server(*, refresh_specs: bool = False) -> Server[Any]:
     """Create and configure the dynamic MCP server instance."""
     config = load_runtime_config()
@@ -852,6 +958,8 @@ def create_server(*, refresh_specs: bool = False) -> Server[Any]:
             "Hetzner MCP server with full Cloud + Storage API coverage. "
             "Use list_api_operations/search_api_operations to discover operations, "
             "then call operation tools directly by operationId. "
+            "Docs-first policy is enforced: for each endpoint, call guide_<operationId> "
+            "first to unlock execution for 30 minutes in this session. "
             "Use guide_<operationId> and category_guide_<domain>_<slug> tools for detailed "
             "docs-based explanations."
         ),
@@ -863,7 +971,8 @@ def create_server(*, refresh_specs: bool = False) -> Server[Any]:
 
     @server.call_tool(validate_input=False)  # type: ignore[untyped-decorator]
     async def _call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
-        return await app.call_tool(name=name, arguments=arguments)
+        session_key = _session_key_from_server(server)
+        return await app.call_tool(name=name, arguments=arguments, session_key=session_key)
 
     return server
 

@@ -77,10 +77,20 @@ def test_get_api_operation_details_helper() -> None:
 
 def test_operation_call_routes_to_http_client() -> None:
     app = _app()
+    unlock = asyncio.run(
+        app.call_tool(
+            name="guide_get_action",
+            arguments={},
+            session_key="session-a",
+        )
+    )
+    assert unlock.isError is False
+
     result = asyncio.run(
         app.call_tool(
             name="get_action",
             arguments={"path": {"id": 123}},
+            session_key="session-a",
         )
     )
 
@@ -90,6 +100,63 @@ def test_operation_call_routes_to_http_client() -> None:
     response = result.structuredContent["response"]
     assert response["operation"] == "get_action"
     assert response["path_params"] == {"id": 123}
+
+
+def test_operation_requires_docs_first_in_same_session() -> None:
+    app = _app()
+
+    blocked = asyncio.run(
+        app.call_tool(
+            name="get_action",
+            arguments={"path": {"id": 123}},
+            session_key="session-a",
+        )
+    )
+    assert blocked.isError is True
+    assert blocked.structuredContent is not None
+    assert blocked.structuredContent["error"]["code"] == "docs_required"
+
+    unlocked = asyncio.run(
+        app.call_tool(
+            name="guide_get_action",
+            arguments={},
+            session_key="session-a",
+        )
+    )
+    assert unlocked.isError is False
+
+    allowed = asyncio.run(
+        app.call_tool(
+            name="get_action",
+            arguments={"path": {"id": 123}},
+            session_key="session-a",
+        )
+    )
+    assert allowed.isError is False
+
+
+def test_docs_unlock_is_session_scoped() -> None:
+    app = _app()
+
+    unlock = asyncio.run(
+        app.call_tool(
+            name="guide_get_action",
+            arguments={},
+            session_key="session-a",
+        )
+    )
+    assert unlock.isError is False
+
+    blocked_other_session = asyncio.run(
+        app.call_tool(
+            name="get_action",
+            arguments={"path": {"id": 123}},
+            session_key="session-b",
+        )
+    )
+    assert blocked_other_session.isError is True
+    assert blocked_other_session.structuredContent is not None
+    assert blocked_other_session.structuredContent["error"]["code"] == "docs_required"
 
 
 def test_endpoint_guide_tool_returns_detailed_docs_payload() -> None:

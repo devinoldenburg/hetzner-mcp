@@ -60,6 +60,16 @@ For agent-friendly documentation, every endpoint and category also has dedicated
 
 These guide tools include docs text from the OpenAPI documentation, explicit purpose, parameter explanations, and example tool arguments.
 
+### Docs-first execution lock (required)
+
+This server enforces a docs-first workflow for endpoint execution:
+
+1. Call `guide_<operation_id>` first for the endpoint you want to execute.
+2. That unlocks the execution tool for **30 minutes** in the current MCP session.
+3. Then call the endpoint tool itself (for example `create_server`).
+
+If you skip step 1, execution is rejected with a `docs_required` error.
+
 ## Full Coverage
 
 Current generated operation coverage:
