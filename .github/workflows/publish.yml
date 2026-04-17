@@ -75,5 +75,31 @@ jobs:
       - name: Build package
         run: python -m build --wheel --sdist
 
-      - name: Publish to PyPI
+      - name: Resolve PyPI publish mode
+        id: pypi_mode
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+          PYPI_TRUSTED_PUBLISHING: ${{ vars.PYPI_TRUSTED_PUBLISHING }}
+        run: |
+          if [ -n "$PYPI_API_TOKEN" ]; then
+            echo "mode=token" >> "$GITHUB_OUTPUT"
+          elif [ "$PYPI_TRUSTED_PUBLISHING" = "true" ]; then
+            echo "mode=oidc" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip PyPI publish (not configured)
+        if: steps.pypi_mode.outputs.mode == 'skip'
+        run: |
+          echo "Skipping publish: set secret PYPI_API_TOKEN or repo variable PYPI_TRUSTED_PUBLISHING=true"
+
+      - name: Publish to PyPI (API token)
+        if: steps.pypi_mode.outputs.mode == 'token'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: Publish to PyPI (trusted publishing)
+        if: steps.pypi_mode.outputs.mode == 'oidc'
         uses: pypa/gh-action-pypi-publish@release/v1
