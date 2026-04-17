@@ -12,10 +12,10 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from hetzner_mcp.registry import OperationRegistry
-
 
 def main() -> int:
+    from hetzner_mcp.registry import OperationRegistry
+
     registry = OperationRegistry.load(refresh_specs=True)
     print(
         json.dumps(

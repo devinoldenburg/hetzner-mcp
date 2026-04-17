@@ -11,14 +11,14 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from hetzner_mcp.registry import OperationRegistry
-
 EXPECTED_CLOUD = 189
 EXPECTED_STORAGE = 32
 EXPECTED_TOTAL = 221
 
 
 def main() -> int:
+    from hetzner_mcp.registry import OperationRegistry
+
     registry = OperationRegistry.load(refresh_specs=False)
     counts = registry.counts_by_domain()
 
