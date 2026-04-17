@@ -7,26 +7,37 @@ on:
 
 jobs:
   npm-publish:
-    if: ${{ hashFiles('packaging/npm/package.json') != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
-    defaults:
-      run:
-        working-directory: packaging/npm
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      - name: Check npm package presence
+        id: pkg
+        run: |
+          if [ -f "packaging/npm/package.json" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip npm publish (no packaging/npm/package.json)
+        if: steps.pkg.outputs.exists != 'true'
+        run: echo "No npm package found; skipping npm publish job."
 
       - name: Set up Node.js
+        if: steps.pkg.outputs.exists == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
           registry-url: https://registry.npmjs.org
 
       - name: Extract version from ref
+        if: steps.pkg.outputs.exists == 'true'
         id: version
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
@@ -37,9 +48,13 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Update package version
+        if: steps.pkg.outputs.exists == 'true'
+        working-directory: packaging/npm
         run: npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
 
       - name: Publish to npm
+        if: steps.pkg.outputs.exists == 'true'
+        working-directory: packaging/npm
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
