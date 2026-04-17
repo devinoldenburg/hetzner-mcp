@@ -1010,7 +1010,7 @@ def create_server(*, refresh_specs: bool = False) -> Server[Any]:
 
     server: Server[Any] = Server(
         name="hetzner-mcp",
-        version="0.1.1",
+        version="0.1.2",
         instructions=(
             "Hetzner MCP server with full Cloud + Storage API coverage. "
             "Use list_api_operations/search_api_operations to discover operations, "

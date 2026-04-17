@@ -28,6 +28,12 @@ Then set your token and restart your MCP client:
 export HETZNER_TOKEN="your_token_here"
 ```
 
+Or configure it once via CLI (persisted local config):
+
+```bash
+hetzner-mcp auth set --token "your_token_here"
+```
+
 ## What It Does
 
 `hetzner-mcp` loads official OpenAPI specs from Hetzner and exposes operations as MCP tools.
@@ -104,11 +110,38 @@ python scripts/verify_operation_coverage.py
 
 ## Authentication
 
-Set one of the following:
+You can configure auth in two ways:
+
+1) Environment variables (recommended for CI/ephemeral environments)
+2) Local CLI config file (recommended for local workstation use)
+
+Environment variables (highest precedence):
 
 - `HETZNER_TOKEN` for both Cloud and Storage APIs
 - `HETZNER_CLOUD_TOKEN` to override cloud auth token
 - `HETZNER_STORAGE_TOKEN` to override storage auth token
+
+Local CLI config examples:
+
+```bash
+# set default token
+hetzner-mcp auth set --token "your_token_here"
+
+# set per-domain overrides
+hetzner-mcp auth set --cloud-token "cloud_token" --storage-token "storage_token"
+
+# inspect effective token sources (env/file/unset)
+hetzner-mcp auth show
+
+# open full local config in your editor
+hetzner-mcp config edit
+```
+
+Config file location:
+
+- `~/.config/hetzner-mcp/config.json` (macOS/Linux)
+- `%APPDATA%\\hetzner-mcp\\config.json` (Windows)
+- Override path with `HETZNER_MCP_CONFIG_PATH`
 
 Optional runtime controls:
 
@@ -154,12 +187,21 @@ hetzner-mcp install
 
 | Command | Description |
 |---------|-------------|
-| `hetzner-mcp install` | Configure supported MCP clients |
-| `hetzner-mcp status` | Show config + registry status |
-| `hetzner-mcp diagnose` | Print diagnostics (supports `--json`) |
-| `hetzner-mcp repair` | Re-apply configuration entries |
-| `hetzner-mcp uninstall` | Remove MCP config entries |
-| `hetzner-mcp server` | Run stdio MCP server |
+| `hetzner-mcp status` | Show effective runtime config + registry + client status |
+| `hetzner-mcp doctor [--json]` | Print detailed diagnostics |
+| `hetzner-mcp server run [--refresh-specs]` | Run stdio MCP server |
+| `hetzner-mcp client install` | Configure supported MCP clients |
+| `hetzner-mcp client status` | Show client config installation state |
+| `hetzner-mcp client repair` | Re-apply configuration entries |
+| `hetzner-mcp client uninstall` | Remove MCP config entries |
+| `hetzner-mcp auth set ...` | Configure API keys directly from CLI |
+| `hetzner-mcp auth show` | Show token status and source |
+| `hetzner-mcp auth clear [--all]` | Clear stored token entries |
+| `hetzner-mcp config show` | Show stored + effective config |
+| `hetzner-mcp config get/set/unset <key>` | Read/write persisted config keys |
+| `hetzner-mcp config edit` | Edit persisted config file in `$EDITOR` |
+
+Legacy aliases still work: `install`, `repair`, `uninstall`, `diagnose`.
 
 ## Development
 
