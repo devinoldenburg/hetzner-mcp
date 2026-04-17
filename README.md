@@ -53,6 +53,8 @@ hetzner-mcp auth set --token "your_token_here"
 | `get_api_operation_details` | Inspect full operation details and input schema |
 | `list_api_categories` | List all API categories/tags with docs descriptions |
 | `get_api_category_details` | Explain one category in depth with all endpoints inside |
+| `list_api_projects` | Show configured project profiles and active credential context |
+| `set_active_api_project` | Switch active project profile for agent execution context |
 | `wait_for_action` | Poll cloud/storage actions until completion |
 
 All API operations are also exposed directly as tools using the official operation ID names (for example `create_server`, `get_action`, `create_storage_box`).
@@ -120,6 +122,7 @@ Environment variables (highest precedence):
 - `HETZNER_TOKEN` for both Cloud and Storage APIs
 - `HETZNER_CLOUD_TOKEN` to override cloud auth token
 - `HETZNER_STORAGE_TOKEN` to override storage auth token
+- `HETZNER_PROJECT` to choose one configured local project profile for this session
 
 Local CLI config examples:
 
@@ -135,6 +138,20 @@ hetzner-mcp auth show
 
 # open full local config in your editor
 hetzner-mcp config edit
+```
+
+Multi-project profile examples:
+
+```bash
+# create per-environment profiles
+hetzner-mcp project add prod --description "Production Hetzner" --token "prod_token" --activate
+hetzner-mcp project add staging --description "Staging Hetzner" --token "staging_token"
+
+# see which profile is active and what each one is for
+hetzner-mcp project list
+
+# switch active profile
+hetzner-mcp project use staging
 ```
 
 Config file location:
@@ -198,6 +215,7 @@ hetzner-mcp install
 | `hetzner-mcp auth set ...` | Configure API keys directly from CLI |
 | `hetzner-mcp auth show` | Show token status and source |
 | `hetzner-mcp auth clear [--all]` | Clear stored token entries |
+| `hetzner-mcp project add/list/show/use/remove` | Manage multiple project credential profiles |
 | `hetzner-mcp config show` | Show stored + effective config |
 | `hetzner-mcp config get/set/unset <key>` | Read/write persisted config keys |
 | `hetzner-mcp config edit` | Edit persisted config file in `$EDITOR` |

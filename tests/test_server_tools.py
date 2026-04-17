@@ -54,6 +54,8 @@ def test_list_tools_includes_full_dynamic_set() -> None:
     assert "search_api_operations" in names
     assert "list_api_categories" in names
     assert "get_api_category_details" in names
+    assert "list_api_projects" in names
+    assert "set_active_api_project" in names
     assert "wait_for_action" in names
     assert "create_server" in names
     assert "create_storage_box" in names
@@ -61,7 +63,7 @@ def test_list_tools_includes_full_dynamic_set() -> None:
     assert "guide_create_storage_box" in names
 
     category_count = len(app.registry.all_categories())
-    helper_count = 6
+    helper_count = 8
     expected_tools = (app.registry.operation_count * 2) + category_count + helper_count
     assert len(tools) == expected_tools
 
@@ -311,3 +313,19 @@ def test_category_guide_tool_returns_category_docs_payload() -> None:
     assert result.structuredContent is not None
     assert result.structuredContent["category"]["category_id"] == "cloud:servers"
     assert len(result.structuredContent["operations"]) >= 1
+
+
+def test_list_api_projects_helper_returns_agent_context() -> None:
+    app = _app()
+    result = asyncio.run(
+        app.call_tool(
+            name="list_api_projects",
+            arguments={},
+        )
+    )
+
+    assert result.isError is False
+    assert result.structuredContent is not None
+    assert "active_project" in result.structuredContent
+    assert "projects" in result.structuredContent
+    assert "message_for_agent" in result.structuredContent

@@ -15,7 +15,7 @@ import mcp.server.stdio
 from mcp import types
 from mcp.server import Server
 
-from .config import load_runtime_config
+from .config import get_project_selection, load_runtime_config, project_profiles, set_active_project
 from .errors import HetznerMCPError, ValidationError
 from .http_client import HetznerHttpClient
 from .models import CategorySpec, OperationSpec
@@ -143,6 +143,36 @@ class HetznerMCPApplication:
                 },
             ),
             types.Tool(
+                name="list_api_projects",
+                description=(
+                    "List configured API project profiles, active selection, and guidance so "
+                    "agents can pick the right credentials context."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            ),
+            types.Tool(
+                name="set_active_api_project",
+                description=(
+                    "Set the active API project profile for this server runtime and persisted "
+                    "local config."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project": {
+                            "type": "string",
+                            "description": "Configured project profile name",
+                        }
+                    },
+                    "required": ["project"],
+                    "additionalProperties": False,
+                },
+            ),
+            types.Tool(
                 name="wait_for_action",
                 description=(
                     "Poll a Hetzner action until terminal status. "
@@ -251,6 +281,12 @@ class HetznerMCPApplication:
                 return _success_result(payload)
             if name == "get_api_category_details":
                 payload = self._helper_get_category_details(arguments)
+                return _success_result(payload)
+            if name == "list_api_projects":
+                payload = self._helper_list_projects(arguments)
+                return _success_result(payload)
+            if name == "set_active_api_project":
+                payload = self._helper_set_active_project(arguments)
                 return _success_result(payload)
             if name == "wait_for_action":
                 payload = await self._helper_wait_for_action(arguments)
@@ -457,6 +493,55 @@ class HetznerMCPApplication:
 
         category = self.registry.get_category(category_id)
         return self._build_category_guide(category)
+
+    def _helper_list_projects(self, arguments: dict[str, Any] | None) -> dict[str, Any]:
+        args = arguments or {}
+        if not isinstance(args, dict):
+            raise ValidationError(code="invalid_arguments", message="Arguments must be an object")
+
+        profiles = project_profiles()
+        selection = get_project_selection()
+        agent_message = _project_agent_message_for_server(selection=selection, profiles=profiles)
+        return {
+            "active_project": {
+                "name": selection.get("name"),
+                "source": selection.get("source"),
+                "exists": selection.get("exists"),
+            },
+            "available_projects": [profile["name"] for profile in profiles],
+            "projects": profiles,
+            "message_for_agent": agent_message,
+            "selection_message": selection.get("message"),
+        }
+
+    def _helper_set_active_project(self, arguments: dict[str, Any] | None) -> dict[str, Any]:
+        args = arguments or {}
+        if not isinstance(args, dict):
+            raise ValidationError(code="invalid_arguments", message="Arguments must be an object")
+
+        project = args.get("project")
+        if not isinstance(project, str) or not project.strip():
+            raise ValidationError(code="missing_project", message="project is required")
+
+        profiles = project_profiles()
+        available = {profile["name"] for profile in profiles}
+        if project not in available:
+            raise ValidationError(
+                code="unknown_project",
+                message=f"Unknown project '{project}'. Call list_api_projects first.",
+                details={"available_projects": sorted(available)},
+            )
+
+        set_active_project(project)
+        self.client.config = load_runtime_config()
+
+        payload = self._helper_list_projects({})
+        payload["updated"] = True
+        payload["message"] = (
+            f"Active project switched to '{project}'. New API calls now use this project's "
+            "credentials unless overridden by environment variables."
+        )
+        return payload
 
     def _build_operation_guide(self, operation: OperationSpec) -> dict[str, Any]:
         path_parameters = [
@@ -925,6 +1010,44 @@ def _optional_int(value: Any, *, default: int) -> int:
     return default
 
 
+def _project_agent_message_for_server(
+    *,
+    selection: dict[str, Any],
+    profiles: list[dict[str, Any]],
+) -> str:
+    if not profiles:
+        return (
+            "No project profiles configured. Configure one via CLI: "
+            "hetzner-mcp project add <name> --token <token>."
+        )
+
+    selected = selection.get("name")
+    exists = bool(selection.get("exists"))
+    source = selection.get("source")
+
+    if exists and isinstance(selected, str):
+        for profile in profiles:
+            if profile.get("name") == selected:
+                description = profile.get("description") or "no description"
+                return (
+                    f"Active project is '{selected}' ({description}). "
+                    "Use set_active_api_project to switch when your task targets a different "
+                    "environment."
+                )
+
+    if isinstance(selected, str) and source == "env":
+        return (
+            f"Project env selection '{selected}' does not match configured profiles. "
+            "Resolve by setting HETZNER_PROJECT to a valid name or clearing it."
+        )
+
+    names = ", ".join(str(profile.get("name")) for profile in profiles)
+    return (
+        "Project profiles exist but no valid active project is selected. "
+        f"Available: {names}. Use set_active_api_project first."
+    )
+
+
 def _normalize_api_error(*, result_data: Any, status_code: int) -> dict[str, Any]:
     if isinstance(result_data, dict):
         error_obj = result_data.get("error")
@@ -1010,11 +1133,13 @@ def create_server(*, refresh_specs: bool = False) -> Server[Any]:
 
     server: Server[Any] = Server(
         name="hetzner-mcp",
-        version="0.1.3",
+        version="0.1.4",
         instructions=(
             "Hetzner MCP server with full Cloud + Storage API coverage. "
             "Use list_api_operations/search_api_operations to discover operations, "
             "then call operation tools directly by operationId. "
+            "For multi-project setups, call list_api_projects first to see which credentials "
+            "profile maps to which environment, and use set_active_api_project when needed. "
             "Docs-first policy is enforced: for each endpoint, call guide_<operationId> "
             "first to unlock execution based on context freshness (interaction distance). "
             "Use guide_<operationId> and category_guide_<domain>_<slug> tools for detailed "

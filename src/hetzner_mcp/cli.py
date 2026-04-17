@@ -16,10 +16,11 @@ from typing import Any
 
 from . import __version__
 from .config import (
-    ALLOWED_STORED_CONFIG_KEYS,
     BACKOFF_BASE_SECONDS_KEY,
     CLOUD_BASE_URL_KEY,
+    HETZNER_PROJECT_ENV,
     MAX_RETRIES_KEY,
+    PROJECT_DESCRIPTION_KEY,
     STORAGE_BASE_URL_KEY,
     TIMEOUT_SECONDS_KEY,
     TOKEN_CLOUD_KEY,
@@ -27,10 +28,16 @@ from .config import (
     TOKEN_STORAGE_KEY,
     USER_AGENT_KEY,
     config_file_path,
+    get_project_selection,
+    list_projects,
     load_runtime_config,
     load_stored_config,
+    project_profiles,
     redacted_view,
+    remove_project,
     save_stored_config,
+    set_active_project,
+    upsert_project,
 )
 from .install import install_all, status_all, uninstall_all
 from .registry import OperationRegistry
@@ -109,6 +116,7 @@ CONFIG_KEY_SPECS: tuple[ConfigKeySpec, ...] = (
 )
 
 CONFIG_KEY_MAP: dict[str, ConfigKeySpec] = {spec.cli_key: spec for spec in CONFIG_KEY_SPECS}
+ALL_CONFIG_STORAGE_KEYS: tuple[str, ...] = tuple(spec.storage_key for spec in CONFIG_KEY_SPECS)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -191,6 +199,44 @@ def _build_parser() -> argparse.ArgumentParser:
     auth_clear.add_argument("--storage", action="store_true", dest="clear_storage")
     auth_clear.add_argument("--all", action="store_true", dest="clear_all")
     auth_clear.set_defaults(_handler=_cmd_auth_clear)
+
+    project = sub.add_parser(
+        "project",
+        help="Manage multiple project profiles (multiple API key sets)",
+    )
+    project_sub = project.add_subparsers(dest="project_command")
+
+    project_add = project_sub.add_parser("add", help="Create or update one project profile")
+    project_add.add_argument("name", help="Project profile name")
+    project_add.add_argument("--description", help="Human-friendly project description")
+    project_add.add_argument("--token", help="Default token for this project")
+    project_add.add_argument("--cloud-token", help="Cloud token override for this project")
+    project_add.add_argument("--storage-token", help="Storage token override for this project")
+    project_add.add_argument("--activate", action="store_true", help="Set as active project")
+    project_add.set_defaults(_handler=_cmd_project_add)
+
+    project_list = project_sub.add_parser(
+        "list",
+        help="List configured project profiles and active selection",
+    )
+    project_list.add_argument("--json", action="store_true", help="Output as JSON")
+    project_list.set_defaults(_handler=_cmd_project_list)
+
+    project_show = project_sub.add_parser("show", help="Show one project profile")
+    project_show.add_argument("name", help="Project profile name")
+    project_show.add_argument("--json", action="store_true", help="Output as JSON")
+    project_show.set_defaults(_handler=_cmd_project_show)
+
+    project_use = project_sub.add_parser(
+        "use",
+        help="Set active project profile used by runtime config",
+    )
+    project_use.add_argument("name", help="Project profile name")
+    project_use.set_defaults(_handler=_cmd_project_use)
+
+    project_remove = project_sub.add_parser("remove", help="Remove one project profile")
+    project_remove.add_argument("name", help="Project profile name")
+    project_remove.set_defaults(_handler=_cmd_project_remove)
 
     config = sub.add_parser("config", help="Manage persisted runtime config file")
     config_sub = config.add_subparsers(dest="config_command")
@@ -302,6 +348,8 @@ def _cmd_status(_: argparse.Namespace) -> int:
     redacted = redacted_view(cfg)
     stored = load_stored_config()
     config_path = config_file_path()
+    selection = get_project_selection(stored)
+    profiles = project_profiles(stored)
     default_source = _source_for_setting("HETZNER_TOKEN", TOKEN_DEFAULT_KEY, stored, default=False)
     cloud_source = _source_for_setting(
         "HETZNER_CLOUD_TOKEN", TOKEN_CLOUD_KEY, stored, default=False
@@ -342,6 +390,22 @@ def _cmd_status(_: argparse.Namespace) -> int:
     print(f"- timeout:       {redacted.timeout_seconds}s (source: {timeout_source})")
     print(f"- max retries:   {redacted.max_retries} (source: {retries_source})")
 
+    print("\nProject routing")
+    print(
+        "- selected project: "
+        f"{selection.get('name') or '<none>'} "
+        f"(source: {selection.get('source')}, exists: {selection.get('exists')})"
+    )
+    if profiles:
+        for profile in profiles:
+            role = "active" if profile.get("is_active") else "available"
+            description = profile.get("description") or "no description"
+            token_flags = _project_token_flags(profile)
+            print(f"- profile {profile['name']}: {description} ({role}; tokens: {token_flags})")
+    else:
+        print("- profiles: none")
+    print(f"- agent message: {_project_agent_message(selection=selection, profiles=profiles)}")
+
     try:
         registry = OperationRegistry.load(refresh_specs=False)
         counts = registry.counts_by_domain()
@@ -364,6 +428,8 @@ def _cmd_status(_: argparse.Namespace) -> int:
 def _cmd_doctor(args: argparse.Namespace) -> int:
     as_json = bool(args.json)
     stored = load_stored_config()
+    selection = get_project_selection(stored)
+    profiles = project_profiles(stored)
     data: dict[str, Any] = {
         "python": {
             "version": sys.version,
@@ -372,6 +438,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         },
         "config_path": str(config_file_path()),
         "stored_config": _redacted_stored_payload(stored),
+        "project_selection": selection,
+        "project_profiles": profiles,
+        "project_message": _project_agent_message(selection=selection, profiles=profiles),
         "config": asdict(redacted_view(load_runtime_config())),
         "config_sources": {
             "token_default": _source_for_setting(
@@ -470,6 +539,8 @@ def _cmd_auth_set(args: argparse.Namespace) -> int:
 def _cmd_auth_show(args: argparse.Namespace) -> int:
     as_json = bool(args.json)
     stored = load_stored_config()
+    selection = get_project_selection(stored)
+    profiles = project_profiles(stored)
     effective = redacted_view(load_runtime_config())
     config_path = config_file_path()
     default_source = _source_for_setting("HETZNER_TOKEN", TOKEN_DEFAULT_KEY, stored, default=False)
@@ -495,6 +566,8 @@ def _cmd_auth_show(args: argparse.Namespace) -> int:
             "configured": effective.has_storage_token,
             "source": storage_source,
         },
+        "project_selection": selection,
+        "message_for_agent": _project_agent_message(selection=selection, profiles=profiles),
     }
 
     if as_json:
@@ -516,6 +589,12 @@ def _cmd_auth_show(args: argparse.Namespace) -> int:
         f"{'yes' if effective.has_storage_token else 'no'} "
         f"(source: {storage_source})"
     )
+    print(
+        "- selected project: "
+        f"{selection.get('name') or '<none>'} "
+        f"(source: {selection.get('source')}, exists: {selection.get('exists')})"
+    )
+    print(f"- agent message: {_project_agent_message(selection=selection, profiles=profiles)}")
     return 0
 
 
@@ -544,15 +623,163 @@ def _cmd_auth_clear(args: argparse.Namespace) -> int:
     return _cmd_auth_show(_namespace_with_json_false())
 
 
+def _cmd_project_add(args: argparse.Namespace) -> int:
+    name = _optional_non_empty_string(args.name)
+    if name is None:
+        print("Project name is required")
+        return 2
+
+    updates: dict[str, Any] = {}
+    description = _optional_non_empty_string(args.description)
+    if description is not None:
+        updates[PROJECT_DESCRIPTION_KEY] = description
+
+    token = _optional_non_empty_string(args.token)
+    if token is not None:
+        updates[TOKEN_DEFAULT_KEY] = token
+
+    cloud_token = _optional_non_empty_string(args.cloud_token)
+    if cloud_token is not None:
+        updates[TOKEN_CLOUD_KEY] = cloud_token
+
+    storage_token = _optional_non_empty_string(args.storage_token)
+    if storage_token is not None:
+        updates[TOKEN_STORAGE_KEY] = storage_token
+
+    if not updates:
+        print("No project values provided. Add token values and/or --description.")
+        return 2
+
+    try:
+        upsert_project(name=name, values=updates, activate=bool(args.activate))
+    except ValueError as exc:
+        print(str(exc))
+        return 2
+
+    print(f"Saved project '{name}' in {config_file_path()}")
+    if bool(args.activate):
+        print(f"Active project set to '{name}'")
+    return _cmd_project_list(_namespace_with_json_false())
+
+
+def _cmd_project_list(args: argparse.Namespace) -> int:
+    as_json = bool(args.json)
+    stored = load_stored_config()
+    profiles = project_profiles(stored)
+    selection = get_project_selection(stored)
+
+    payload = {
+        "config_path": str(config_file_path()),
+        "project_env_var": HETZNER_PROJECT_ENV,
+        "selection": selection,
+        "profiles": profiles,
+        "message_for_agent": _project_agent_message(selection=selection, profiles=profiles),
+    }
+
+    if as_json:
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print("Projects")
+    print(f"- config path: {payload['config_path']}")
+    selected = selection.get("name")
+    source = selection.get("source")
+    exists = selection.get("exists")
+    print(f"- selected project: {selected or '<none>'} (source: {source}, exists: {exists})")
+    if not profiles:
+        print("- profiles: none")
+    else:
+        for profile in profiles:
+            role = "active" if profile.get("is_active") else "available"
+            description = profile.get("description") or "no description"
+            token_flags = _project_token_flags(profile)
+            print(f"- {profile['name']}: {description} ({role}; tokens: {token_flags})")
+    print(f"- agent message: {payload['message_for_agent']}")
+    return 0
+
+
+def _cmd_project_show(args: argparse.Namespace) -> int:
+    as_json = bool(args.json)
+    name = _optional_non_empty_string(args.name)
+    if name is None:
+        print("Project name is required")
+        return 2
+
+    stored = load_stored_config()
+    projects = list_projects(stored)
+    project = projects.get(name)
+    if project is None:
+        print(f"Unknown project '{name}'.")
+        return 2
+
+    selection = get_project_selection(stored)
+    payload = {
+        "name": name,
+        "description": project.get(PROJECT_DESCRIPTION_KEY),
+        "has_default_token": bool(_optional_non_empty_string(project.get(TOKEN_DEFAULT_KEY))),
+        "has_cloud_token": bool(_optional_non_empty_string(project.get(TOKEN_CLOUD_KEY))),
+        "has_storage_token": bool(_optional_non_empty_string(project.get(TOKEN_STORAGE_KEY))),
+        "is_active": bool(selection.get("exists") and selection.get("name") == name),
+    }
+
+    if as_json:
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print(f"Project {name}")
+    print(f"- description: {payload['description'] or 'none'}")
+    print(f"- active: {payload['is_active']}")
+    print(f"- default token: {payload['has_default_token']}")
+    print(f"- cloud token:   {payload['has_cloud_token']}")
+    print(f"- storage token: {payload['has_storage_token']}")
+    return 0
+
+
+def _cmd_project_use(args: argparse.Namespace) -> int:
+    name = _optional_non_empty_string(args.name)
+    if name is None:
+        print("Project name is required")
+        return 2
+
+    projects = list_projects(load_stored_config())
+    if name not in projects:
+        print(f"Unknown project '{name}'. Use 'hetzner-mcp project list' first.")
+        return 2
+
+    set_active_project(name)
+    print(f"Active project set to '{name}'")
+    return _cmd_project_list(_namespace_with_json_false())
+
+
+def _cmd_project_remove(args: argparse.Namespace) -> int:
+    name = _optional_non_empty_string(args.name)
+    if name is None:
+        print("Project name is required")
+        return 2
+
+    projects = list_projects(load_stored_config())
+    if name not in projects:
+        print(f"Project '{name}' is not configured.")
+        return 2
+
+    remove_project(name)
+    print(f"Removed project '{name}'")
+    return _cmd_project_list(_namespace_with_json_false())
+
+
 def _cmd_config_show(args: argparse.Namespace) -> int:
     as_json = bool(args.json)
     stored = load_stored_config()
+    selection = get_project_selection(stored)
+    profiles = project_profiles(stored)
     effective = redacted_view(load_runtime_config())
 
     payload: dict[str, Any] = {
         "config_path": str(config_file_path()),
         "stored_path_exists": config_file_path().exists(),
         "stored": _redacted_stored_payload(stored),
+        "project_selection": selection,
+        "project_profiles": profiles,
         "effective": asdict(effective),
     }
 
@@ -570,6 +797,17 @@ def _cmd_config_show(args: argparse.Namespace) -> int:
     else:
         for key in sorted(payload["stored"].keys()):
             print(f"- {key}: {payload['stored'][key]}")
+
+    print(
+        "- selected project: "
+        f"{selection.get('name') or '<none>'} "
+        f"(source: {selection.get('source')}, exists: {selection.get('exists')})"
+    )
+    if profiles:
+        for profile in profiles:
+            role = "active" if profile.get("is_active") else "available"
+            description = profile.get("description") or "no description"
+            print(f"- project {profile['name']}: {description} ({role})")
 
     print("\nEffective runtime")
     print(f"- default token: {'yes' if effective.has_default_token else 'no'}")
@@ -619,7 +857,7 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
     keys_raw = [str(key) for key in list(args.keys)]
 
     if clear_all:
-        removals = list(ALLOWED_STORED_CONFIG_KEYS)
+        removals = list(ALL_CONFIG_STORAGE_KEYS)
     else:
         if not keys_raw:
             print("No keys specified. Use 'config unset <key>' or '--all'.")
@@ -704,7 +942,78 @@ def _redacted_stored_payload(stored: dict[str, Any]) -> dict[str, Any]:
         if spec.storage_key not in stored:
             continue
         out[spec.cli_key] = "<redacted>" if spec.secret else stored[spec.storage_key]
+
+    selection = get_project_selection(stored)
+    out["active_project"] = selection.get("name")
+
+    projects = list_projects(stored)
+    if projects:
+        out["projects"] = {}
+        for name, values in projects.items():
+            out["projects"][name] = {
+                "description": values.get(PROJECT_DESCRIPTION_KEY),
+                "token": "<redacted>"
+                if _optional_non_empty_string(values.get(TOKEN_DEFAULT_KEY))
+                else None,
+                "cloud-token": "<redacted>"
+                if _optional_non_empty_string(values.get(TOKEN_CLOUD_KEY))
+                else None,
+                "storage-token": "<redacted>"
+                if _optional_non_empty_string(values.get(TOKEN_STORAGE_KEY))
+                else None,
+            }
     return out
+
+
+def _project_token_flags(profile: dict[str, Any]) -> str:
+    has_default = bool(profile.get("has_default_token"))
+    has_cloud = bool(profile.get("has_cloud_token"))
+    has_storage = bool(profile.get("has_storage_token"))
+
+    parts: list[str] = []
+    if has_default:
+        parts.append("default")
+    if has_cloud:
+        parts.append("cloud")
+    if has_storage:
+        parts.append("storage")
+    if not parts:
+        return "none"
+    return ",".join(parts)
+
+
+def _project_agent_message(*, selection: dict[str, Any], profiles: list[dict[str, Any]]) -> str:
+    if not profiles:
+        return (
+            "No project profiles are configured yet. Add one with "
+            "'hetzner-mcp project add <name> --token <token>'."
+        )
+
+    selected = selection.get("name")
+    exists = bool(selection.get("exists"))
+    source = selection.get("source")
+
+    if exists and isinstance(selected, str):
+        for profile in profiles:
+            if profile.get("name") == selected:
+                description = profile.get("description") or "no description"
+                return (
+                    f"Use project '{selected}' for {description}. "
+                    "Switch project with 'hetzner-mcp project use <name>' or set "
+                    f"{HETZNER_PROJECT_ENV}=<name> for one session."
+                )
+
+    if isinstance(selected, str) and source == "env":
+        return (
+            f"{HETZNER_PROJECT_ENV} is set to '{selected}', but this profile does not exist. "
+            "Unset it or choose an existing profile with 'hetzner-mcp project list'."
+        )
+
+    names = ", ".join(str(profile.get("name")) for profile in profiles)
+    return (
+        "Project profiles are configured but none is active. "
+        f"Available: {names}. Use 'hetzner-mcp project use <name>' to select one."
+    )
 
 
 def _source_for_setting(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import hetzner_mcp.cli as cli
@@ -74,3 +75,59 @@ def test_update_command_continues_when_refresh_fails(monkeypatch: object, capsys
     assert "refresh failed" in captured
     assert "already configured" in captured
     assert "Update complete" in captured
+
+
+def test_project_commands_manage_multiple_profiles(
+    tmp_path: Path, monkeypatch: object, capsys: object
+) -> None:
+    monkeypatch.setenv("HETZNER_MCP_CONFIG_PATH", str(tmp_path / "cfg.json"))
+    monkeypatch.delenv("HETZNER_PROJECT", raising=False)
+
+    add_prod = cli.main(
+        [
+            "project",
+            "add",
+            "prod",
+            "--description",
+            "Production environment",
+            "--token",
+            "prod-token",
+            "--activate",
+        ]
+    )
+    assert add_prod == 0
+    _ = capsys.readouterr()
+
+    add_dev = cli.main(
+        [
+            "project",
+            "add",
+            "dev",
+            "--description",
+            "Development environment",
+            "--token",
+            "dev-token",
+        ]
+    )
+    assert add_dev == 0
+    _ = capsys.readouterr()
+
+    list_exit = cli.main(["project", "list", "--json"])
+    list_output = capsys.readouterr().out
+    assert list_exit == 0
+    payload = json.loads(list_output)
+    assert payload["selection"]["name"] == "prod"
+    assert payload["selection"]["exists"] is True
+    assert len(payload["profiles"]) == 2
+
+    use_exit = cli.main(["project", "use", "dev"])
+    use_output = capsys.readouterr().out
+    assert use_exit == 0
+    assert "Active project set to 'dev'" in use_output
+
+    show_exit = cli.main(["project", "show", "dev", "--json"])
+    show_output = capsys.readouterr().out
+    assert show_exit == 0
+    show_payload = json.loads(show_output)
+    assert show_payload["name"] == "dev"
+    assert show_payload["is_active"] is True
