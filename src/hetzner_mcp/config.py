@@ -36,7 +36,7 @@ def load_runtime_config() -> RuntimeConfig:
         timeout_seconds=timeout_seconds,
         max_retries=max(0, max_retries),
         backoff_base_seconds=max(0.05, backoff_base),
-        user_agent=os.environ.get("HETZNER_MCP_USER_AGENT", "hetzner-mcp/0.1.0"),
+        user_agent=os.environ.get("HETZNER_MCP_USER_AGENT", "hetzner-mcp/0.1.1"),
     )
 
 
