@@ -25,8 +25,9 @@ def main() -> int:
     cloud = counts["cloud"]
     storage = counts["storage"]
     total = registry.operation_count
+    categories = len(registry.all_categories())
 
-    print(f"cloud={cloud} storage={storage} total={total}")
+    print(f"cloud={cloud} storage={storage} total={total} categories={categories}")
 
     if cloud != EXPECTED_CLOUD or storage != EXPECTED_STORAGE or total != EXPECTED_TOTAL:
         print("Coverage verification failed")

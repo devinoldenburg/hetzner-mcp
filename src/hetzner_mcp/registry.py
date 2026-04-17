@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from .errors import OperationNotFoundError, SpecLoadError
-from .models import ApiDomain, OperationSpec, ParameterSpec, RequestBodySpec
+from .models import ApiDomain, CategorySpec, OperationSpec, ParameterSpec, RequestBodySpec
 from .specs import LoadedSpecs, load_specs, resolve_refs
 
 HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head", "options")
@@ -17,13 +18,14 @@ class OperationRegistry:
     """In-memory index of all operations and summary metadata."""
 
     operations: dict[str, OperationSpec]
+    categories: dict[str, CategorySpec]
     loaded_from_cache: bool = False
 
     @classmethod
     def load(cls, *, refresh_specs: bool = False) -> OperationRegistry:
         specs = load_specs(refresh=refresh_specs)
-        operations = _build_registry(specs)
-        return cls(operations=operations)
+        operations, categories = _build_registry(specs)
+        return cls(operations=operations, categories=categories)
 
     @property
     def operation_count(self) -> int:
@@ -40,6 +42,31 @@ class OperationRegistry:
 
     def all_operations(self) -> list[OperationSpec]:
         return sorted(self.operations.values(), key=lambda op: op.operation_id)
+
+    def all_categories(self) -> list[CategorySpec]:
+        return sorted(self.categories.values(), key=lambda cat: cat.category_id)
+
+    def get_category(self, category_id: str) -> CategorySpec:
+        try:
+            return self.categories[category_id]
+        except KeyError as exc:
+            raise OperationNotFoundError(
+                code="category_not_found",
+                message=f"Unknown API category: {category_id}",
+            ) from exc
+
+    def get_category_by_tool_name(self, tool_name: str) -> CategorySpec:
+        for category in self.categories.values():
+            if category.tool_name == tool_name:
+                return category
+        raise OperationNotFoundError(
+            code="category_not_found",
+            message=f"Unknown API category tool: {tool_name}",
+        )
+
+    def operations_for_category(self, category_id: str) -> list[OperationSpec]:
+        category = self.get_category(category_id)
+        return [self.operations[operation_id] for operation_id in category.operation_ids]
 
     def list_filtered(
         self,
@@ -91,8 +118,9 @@ class OperationRegistry:
         return out
 
 
-def _build_registry(specs: LoadedSpecs) -> dict[str, OperationSpec]:
+def _build_registry(specs: LoadedSpecs) -> tuple[dict[str, OperationSpec], dict[str, CategorySpec]]:
     operations: dict[str, OperationSpec] = {}
+    categories: dict[str, CategorySpec] = {}
     sources: tuple[tuple[ApiDomain, dict[str, Any]], ...] = (
         ("cloud", specs.cloud),
         ("storage", specs.storage),
@@ -106,7 +134,17 @@ def _build_registry(specs: LoadedSpecs) -> dict[str, OperationSpec]:
                     message=f"Duplicate operationId detected: {operation.operation_id}",
                 )
             operations[operation.operation_id] = operation
-    return operations
+        parsed_categories = _parse_spec_categories(
+            spec=spec, api_domain=api_domain, operations=parsed
+        )
+        for category in parsed_categories:
+            if category.category_id in categories:
+                raise SpecLoadError(
+                    code="duplicate_category_id",
+                    message=f"Duplicate category id detected: {category.category_id}",
+                )
+            categories[category.category_id] = category
+    return operations, categories
 
 
 def _parse_spec_operations(*, spec: dict[str, Any], api_domain: ApiDomain) -> list[OperationSpec]:
@@ -238,3 +276,53 @@ def _fallback_operation_id(*, method: str, path: str) -> str:
 
 def _string_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _parse_spec_categories(
+    *,
+    spec: dict[str, Any],
+    api_domain: ApiDomain,
+    operations: list[OperationSpec],
+) -> list[CategorySpec]:
+    """Build category docs from OpenAPI tags and operation assignments."""
+    operations_by_tag: dict[str, list[OperationSpec]] = {}
+    for operation in operations:
+        operations_by_tag.setdefault(operation.primary_tag, []).append(operation)
+
+    tag_descriptions: dict[str, str | None] = {}
+    spec_tags = spec.get("tags", [])
+    if isinstance(spec_tags, list):
+        for item in spec_tags:
+            resolved = resolve_refs(item, spec=spec)
+            if not isinstance(resolved, dict):
+                continue
+            tag_name = resolved.get("name")
+            if not isinstance(tag_name, str) or not tag_name:
+                continue
+            tag_descriptions[tag_name] = _string_or_none(resolved.get("description"))
+
+    categories: list[CategorySpec] = []
+    for tag_name, tagged_operations in sorted(
+        operations_by_tag.items(), key=lambda x: x[0].lower()
+    ):
+        slug = _slugify(tag_name)
+        category_id = f"{api_domain}:{slug}"
+        categories.append(
+            CategorySpec(
+                category_id=category_id,
+                api_domain=api_domain,
+                name=tag_name,
+                slug=slug,
+                description=tag_descriptions.get(tag_name),
+                operation_ids=tuple(sorted(op.operation_id for op in tagged_operations)),
+            )
+        )
+
+    return categories
+
+
+def _slugify(value: str) -> str:
+    lowered = value.strip().lower()
+    replaced = re.sub(r"[^a-z0-9]+", "_", lowered)
+    normalized = re.sub(r"_+", "_", replaced).strip("_")
+    return normalized or "untagged"

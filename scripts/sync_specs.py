@@ -21,6 +21,7 @@ def main() -> int:
         json.dumps(
             {
                 "operation_count": registry.operation_count,
+                "category_count": len(registry.all_categories()),
                 "counts_by_domain": registry.counts_by_domain(),
                 "counts_by_tag": registry.counts_by_tag(),
             },

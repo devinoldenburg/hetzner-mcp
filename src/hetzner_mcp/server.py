@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -17,11 +18,14 @@ from mcp.server import Server
 from .config import load_runtime_config
 from .errors import HetznerMCPError, ValidationError
 from .http_client import HetznerHttpClient
-from .models import OperationSpec
+from .models import CategorySpec, OperationSpec
 from .registry import OperationRegistry
 from .request_builder import build_request
 
 logger = logging.getLogger(__name__)
+
+GUIDE_PREFIX = "guide_"
+CATEGORY_GUIDE_PREFIX = "category_guide_"
 
 
 def _configure_logging() -> None:
@@ -85,6 +89,40 @@ class HetznerMCPApplication:
                 },
             ),
             types.Tool(
+                name="list_api_categories",
+                description=(
+                    "List API documentation categories (resource groups/tags) with detailed "
+                    "descriptions and operation coverage."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "api_domain": {"type": "string", "enum": ["cloud", "storage"]},
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            types.Tool(
+                name="get_api_category_details",
+                description=(
+                    "Get full category documentation including what it is for and all endpoints "
+                    "inside it."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "category_id": {
+                            "type": "string",
+                            "description": "Format: <api_domain>:<slug>, example cloud:servers",
+                        }
+                    },
+                    "required": ["category_id"],
+                    "additionalProperties": False,
+                },
+            ),
+            types.Tool(
                 name="wait_for_action",
                 description=(
                     "Poll a Hetzner action until terminal status. "
@@ -122,9 +160,40 @@ class HetznerMCPApplication:
                     name=operation.operation_id,
                     description=(
                         f"[{operation.api_domain}] {operation.method} {operation.path} - "
-                        f"{operation.display_summary}"
+                        f"{operation.display_summary}. "
+                        f"Docs: {_docs_excerpt(operation.docs_text, max_chars=180)}"
                     ),
                     inputSchema=_operation_input_schema(operation),
+                )
+            )
+            tools.append(
+                types.Tool(
+                    name=f"{GUIDE_PREFIX}{operation.operation_id}",
+                    description=(
+                        f"Detailed endpoint guide for {operation.operation_id}: purpose, usage, "
+                        "arguments, and docs text."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                )
+            )
+
+        for category in self.registry.all_categories():
+            tools.append(
+                types.Tool(
+                    name=category.tool_name,
+                    description=(
+                        f"Detailed category guide for {category.name} ({category.api_domain}): "
+                        "what this category is for and all endpoint capabilities."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
                 )
             )
         return tools
@@ -141,9 +210,24 @@ class HetznerMCPApplication:
             if name == "search_api_operations":
                 payload = self._helper_search_operations(arguments)
                 return _success_result(payload)
+            if name == "list_api_categories":
+                payload = self._helper_list_categories(arguments)
+                return _success_result(payload)
+            if name == "get_api_category_details":
+                payload = self._helper_get_category_details(arguments)
+                return _success_result(payload)
             if name == "wait_for_action":
                 payload = await self._helper_wait_for_action(arguments)
                 return _success_result(payload)
+
+            if name.startswith(GUIDE_PREFIX):
+                operation_id = name[len(GUIDE_PREFIX) :]
+                operation = self.registry.get(operation_id)
+                return _success_result(self._build_operation_guide(operation))
+
+            if name.startswith(CATEGORY_GUIDE_PREFIX):
+                category = self.registry.get_category_by_tool_name(name)
+                return _success_result(self._build_category_guide(category))
 
             operation = self.registry.get(name)
             return await self._execute_operation(operation=operation, arguments=arguments)
@@ -185,7 +269,13 @@ class HetznerMCPApplication:
             "total": len(operations),
             "counts_by_domain": self.registry.counts_by_domain(),
             "counts_by_tag": self.registry.counts_by_tag(),
-            "operations": [_operation_summary(op) for op in operations],
+            "operations": [
+                {
+                    **_operation_summary(op),
+                    "endpoint_guide_tool": f"{GUIDE_PREFIX}{op.operation_id}",
+                }
+                for op in operations
+            ],
         }
 
     def _helper_get_operation_details(self, arguments: dict[str, Any] | None) -> dict[str, Any]:
@@ -199,10 +289,21 @@ class HetznerMCPApplication:
                 message="operation_id is required",
             )
         operation = self.registry.get(operation_id)
+        category_tool_name: str | None = None
+        try:
+            category = self.registry.get_category(
+                f"{operation.api_domain}:{_slug_from_tag(operation.primary_tag)}"
+            )
+            category_tool_name = category.tool_name
+        except HetznerMCPError:
+            category_tool_name = None
         return {
             **_operation_summary(operation),
             "description": operation.description,
+            "docs_text": operation.docs_text,
             "input_schema": _operation_input_schema(operation),
+            "endpoint_guide_tool": f"{GUIDE_PREFIX}{operation.operation_id}",
+            "category_guide_tool": category_tool_name,
             "parameters": [
                 {
                     "name": p.name,
@@ -237,7 +338,127 @@ class HetznerMCPApplication:
         return {
             "query": query,
             "total": len(operations),
-            "operations": [_operation_summary(op) for op in operations],
+            "operations": [
+                {
+                    **_operation_summary(op),
+                    "endpoint_guide_tool": f"{GUIDE_PREFIX}{op.operation_id}",
+                }
+                for op in operations
+            ],
+        }
+
+    def _helper_list_categories(self, arguments: dict[str, Any] | None) -> dict[str, Any]:
+        args = arguments or {}
+        if not isinstance(args, dict):
+            raise ValidationError(code="invalid_arguments", message="Arguments must be an object")
+
+        api_domain = args.get("api_domain")
+        if api_domain is not None and api_domain not in {"cloud", "storage"}:
+            raise ValidationError(
+                code="invalid_api_domain", message="api_domain must be cloud or storage"
+            )
+
+        query = _optional_string(args.get("query"))
+        limit = _optional_int(args.get("limit"), default=100)
+
+        categories = self.registry.all_categories()
+        if api_domain:
+            categories = [category for category in categories if category.api_domain == api_domain]
+        if query:
+            query_lower = query.lower()
+            categories = [
+                category
+                for category in categories
+                if query_lower in category.name.lower()
+                or query_lower in category.slug.lower()
+                or query_lower in (category.description or "").lower()
+            ]
+
+        categories = categories[: max(limit, 1)]
+        return {
+            "total": len(categories),
+            "categories": [
+                {
+                    "category_id": category.category_id,
+                    "api_domain": category.api_domain,
+                    "name": category.name,
+                    "slug": category.slug,
+                    "operation_count": len(category.operation_ids),
+                    "description": category.description,
+                    "description_excerpt": _docs_excerpt(category.description or ""),
+                    "category_guide_tool": category.tool_name,
+                }
+                for category in categories
+            ],
+        }
+
+    def _helper_get_category_details(self, arguments: dict[str, Any] | None) -> dict[str, Any]:
+        args = arguments or {}
+        if not isinstance(args, dict):
+            raise ValidationError(code="invalid_arguments", message="Arguments must be an object")
+
+        category_id = args.get("category_id")
+        if not isinstance(category_id, str) or not category_id:
+            raise ValidationError(code="missing_category_id", message="category_id is required")
+
+        category = self.registry.get_category(category_id)
+        return self._build_category_guide(category)
+
+    def _build_operation_guide(self, operation: OperationSpec) -> dict[str, Any]:
+        path_parameters = [
+            parameter for parameter in operation.parameters if parameter.location == "path"
+        ]
+        query_parameters = [
+            parameter for parameter in operation.parameters if parameter.location == "query"
+        ]
+
+        return {
+            "operation": _operation_summary(operation),
+            "purpose": operation.display_summary,
+            "what_it_is_for": _derive_operation_purpose(operation),
+            "docs_text": operation.docs_text,
+            "required_path_parameters": [
+                parameter.name for parameter in path_parameters if parameter.required
+            ],
+            "path_parameters": [_parameter_doc(parameter) for parameter in path_parameters],
+            "query_parameters": [_parameter_doc(parameter) for parameter in query_parameters],
+            "request_body": (
+                {
+                    "required": operation.request_body.required,
+                    "description": operation.request_body.description,
+                    "schema": operation.request_body.schema,
+                    "example": _example_body(operation.request_body.schema),
+                }
+                if operation.request_body
+                else None
+            ),
+            "example_tool_arguments": _example_tool_arguments(operation),
+            "execute_tool": operation.operation_id,
+        }
+
+    def _build_category_guide(self, category: CategorySpec) -> dict[str, Any]:
+        operations = self.registry.operations_for_category(category.category_id)
+        return {
+            "category": {
+                "category_id": category.category_id,
+                "api_domain": category.api_domain,
+                "name": category.name,
+                "slug": category.slug,
+                "description": category.description,
+                "description_excerpt": _docs_excerpt(category.description or ""),
+                "operation_count": len(operations),
+                "category_guide_tool": category.tool_name,
+            },
+            "what_it_is_for": _derive_category_purpose(category),
+            "operations": [
+                {
+                    **_operation_summary(operation),
+                    "docs_excerpt": _docs_excerpt(operation.docs_text),
+                    "execute_tool": operation.operation_id,
+                    "endpoint_guide_tool": f"{GUIDE_PREFIX}{operation.operation_id}",
+                }
+                for operation in operations
+            ],
         }
 
     async def _helper_wait_for_action(self, arguments: dict[str, Any] | None) -> dict[str, Any]:
@@ -429,7 +650,128 @@ def _operation_summary(operation: OperationSpec) -> dict[str, Any]:
         "path": operation.path,
         "tag": operation.primary_tag,
         "summary": operation.display_summary,
+        "docs_excerpt": _docs_excerpt(operation.docs_text),
     }
+
+
+def _parameter_doc(parameter: Any) -> dict[str, Any]:
+    return {
+        "name": parameter.name,
+        "in": parameter.location,
+        "required": parameter.required,
+        "description": parameter.description,
+        "schema": parameter.schema,
+        "example": _example_value(parameter.schema),
+    }
+
+
+def _derive_operation_purpose(operation: OperationSpec) -> str:
+    action = {
+        "GET": "read or inspect",
+        "POST": "create or trigger",
+        "PUT": "replace or update",
+        "PATCH": "partially update",
+        "DELETE": "remove",
+    }.get(operation.method, "operate on")
+    return (
+        f"Use this endpoint to {action} resources in category '{operation.primary_tag}'. "
+        f"It targets {operation.path} on the {operation.api_domain} API."
+    )
+
+
+def _derive_category_purpose(category: CategorySpec) -> str:
+    if category.description:
+        return category.description
+    return (
+        f"This category groups related endpoints for '{category.name}' on the "
+        f"{category.api_domain} API."
+    )
+
+
+def _example_tool_arguments(operation: OperationSpec) -> dict[str, Any]:
+    path_parameters = [
+        parameter for parameter in operation.parameters if parameter.location == "path"
+    ]
+    query_parameters = [
+        parameter for parameter in operation.parameters if parameter.location == "query"
+    ]
+
+    out: dict[str, Any] = {}
+    if path_parameters:
+        out["path"] = {
+            parameter.name: _example_value(parameter.schema) for parameter in path_parameters
+        }
+    if query_parameters:
+        out["query"] = {
+            parameter.name: _example_value(parameter.schema)
+            for parameter in query_parameters
+            if parameter.required
+        }
+    if operation.request_body is not None:
+        out["body"] = _example_body(operation.request_body.schema)
+    return out
+
+
+def _example_body(schema: dict[str, Any] | None) -> Any:
+    if not isinstance(schema, dict):
+        return {"example": "value"}
+
+    schema_type = schema.get("type")
+    if schema_type == "object":
+        properties = schema.get("properties", {})
+        if isinstance(properties, dict):
+            result: dict[str, Any] = {}
+            required = schema.get("required", [])
+            required_keys = [str(item) for item in required] if isinstance(required, list) else []
+            selected_keys = required_keys or list(properties.keys())[:3]
+            for key in selected_keys:
+                sub_schema = properties.get(key, {"type": "string"})
+                if isinstance(sub_schema, dict):
+                    result[key] = _example_value(sub_schema)
+                else:
+                    result[key] = "example"
+            return result
+        return {}
+    if schema_type == "array":
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            return [_example_value(item_schema)]
+        return ["example"]
+    return _example_value(schema)
+
+
+def _example_value(schema: dict[str, Any]) -> Any:
+    if "enum" in schema and isinstance(schema["enum"], list) and schema["enum"]:
+        return schema["enum"][0]
+    schema_type = schema.get("type")
+    if schema_type == "integer":
+        return 1
+    if schema_type == "number":
+        return 1.0
+    if schema_type == "boolean":
+        return True
+    if schema_type == "array":
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            return [_example_value(item_schema)]
+        return ["example"]
+    if schema_type == "object":
+        return _example_body(schema)
+    return "example"
+
+
+def _docs_excerpt(text: str, *, max_chars: int = 220) -> str:
+    clean = " ".join(text.split())
+    if len(clean) <= max_chars:
+        return clean
+    return clean[: max_chars - 3].rstrip() + "..."
+
+
+def _slug_from_tag(tag: str) -> str:
+    lowered = tag.strip().lower()
+    replaced = re.sub(r"[^a-z0-9]+", "_", lowered)
+    normalized = re.sub(r"_+", "_", replaced).strip("_")
+    return normalized or "untagged"
 
 
 def _optional_string(value: Any) -> str | None:
@@ -509,7 +851,9 @@ def create_server(*, refresh_specs: bool = False) -> Server[Any]:
         instructions=(
             "Hetzner MCP server with full Cloud + Storage API coverage. "
             "Use list_api_operations/search_api_operations to discover operations, "
-            "then call operation tools directly by operationId."
+            "then call operation tools directly by operationId. "
+            "Use guide_<operationId> and category_guide_<domain>_<slug> tools for detailed "
+            "docs-based explanations."
         ),
     )
 

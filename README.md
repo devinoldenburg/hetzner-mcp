@@ -45,9 +45,20 @@ export HETZNER_TOKEN="your_token_here"
 | `list_api_operations` | List all operations with filters (domain/tag/method/query) |
 | `search_api_operations` | Search operations by keyword |
 | `get_api_operation_details` | Inspect full operation details and input schema |
+| `list_api_categories` | List all API categories/tags with docs descriptions |
+| `get_api_category_details` | Explain one category in depth with all endpoints inside |
 | `wait_for_action` | Poll cloud/storage actions until completion |
 
 All API operations are also exposed directly as tools using the official operation ID names (for example `create_server`, `get_action`, `create_storage_box`).
+
+For agent-friendly documentation, every endpoint and category also has dedicated guide tools:
+
+- Endpoint guide tool pattern: `guide_<operation_id>`
+  - Example: `guide_create_server`
+- Category guide tool pattern: `category_guide_<api_domain>_<category_slug>`
+  - Example: `category_guide_cloud_servers`
+
+These guide tools include docs text from the OpenAPI documentation, explicit purpose, parameter explanations, and example tool arguments.
 
 ## Full Coverage
 

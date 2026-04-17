@@ -55,6 +55,31 @@ class OperationSpec:
             return self.description.splitlines()[0]
         return f"{self.method} {self.path}"
 
+    @property
+    def docs_text(self) -> str:
+        """Best available endpoint docs text from OpenAPI content."""
+        if self.description:
+            return self.description
+        if self.summary:
+            return self.summary
+        return f"{self.method} {self.path}"
+
+
+@dataclass(slots=True, frozen=True)
+class CategorySpec:
+    """Category/tag-level API documentation group."""
+
+    category_id: str
+    api_domain: ApiDomain
+    name: str
+    slug: str
+    description: str | None
+    operation_ids: tuple[str, ...]
+
+    @property
+    def tool_name(self) -> str:
+        return f"category_guide_{self.api_domain}_{self.slug}"
+
 
 @dataclass(slots=True, frozen=True)
 class HttpResult:

@@ -103,6 +103,7 @@ def _status() -> int:
         counts = registry.counts_by_domain()
         print("\nRegistry")
         print(f"- total operations: {registry.operation_count}")
+        print(f"- total categories: {len(registry.all_categories())}")
         print(f"- cloud operations: {counts['cloud']}")
         print(f"- storage operations: {counts['storage']}")
     except Exception as exc:
@@ -131,6 +132,7 @@ def _diagnose(*, as_json: bool) -> int:
         registry = OperationRegistry.load(refresh_specs=False)
         data["registry"] = {
             "operation_count": registry.operation_count,
+            "category_count": len(registry.all_categories()),
             "counts_by_domain": registry.counts_by_domain(),
             "counts_by_tag": registry.counts_by_tag(),
         }

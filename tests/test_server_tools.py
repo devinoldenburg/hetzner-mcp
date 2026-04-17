@@ -48,10 +48,18 @@ def test_list_tools_includes_full_dynamic_set() -> None:
     assert "list_api_operations" in names
     assert "get_api_operation_details" in names
     assert "search_api_operations" in names
+    assert "list_api_categories" in names
+    assert "get_api_category_details" in names
     assert "wait_for_action" in names
     assert "create_server" in names
     assert "create_storage_box" in names
-    assert len(tools) == app.registry.operation_count + 4
+    assert "guide_create_server" in names
+    assert "guide_create_storage_box" in names
+
+    category_count = len(app.registry.all_categories())
+    helper_count = 6
+    expected_tools = (app.registry.operation_count * 2) + category_count + helper_count
+    assert len(tools) == expected_tools
 
 
 def test_get_api_operation_details_helper() -> None:
@@ -82,3 +90,35 @@ def test_operation_call_routes_to_http_client() -> None:
     response = result.structuredContent["response"]
     assert response["operation"] == "get_action"
     assert response["path_params"] == {"id": 123}
+
+
+def test_endpoint_guide_tool_returns_detailed_docs_payload() -> None:
+    app = _app()
+    result = asyncio.run(
+        app.call_tool(
+            name="guide_create_server",
+            arguments={},
+        )
+    )
+
+    assert result.isError is False
+    assert result.structuredContent is not None
+    assert result.structuredContent["operation"]["operation_id"] == "create_server"
+    assert "what_it_is_for" in result.structuredContent
+    assert result.structuredContent["execute_tool"] == "create_server"
+
+
+def test_category_guide_tool_returns_category_docs_payload() -> None:
+    app = _app()
+    category = app.registry.get_category("cloud:servers")
+    result = asyncio.run(
+        app.call_tool(
+            name=category.tool_name,
+            arguments={},
+        )
+    )
+
+    assert result.isError is False
+    assert result.structuredContent is not None
+    assert result.structuredContent["category"]["category_id"] == "cloud:servers"
+    assert len(result.structuredContent["operations"]) >= 1
