@@ -263,5 +263,5 @@ def _resolve_local_ref(*, ref: str, spec: dict[str, Any]) -> Any:
 
 
 def _user_agent() -> str:
-    version = os.environ.get("HETZNER_MCP_VERSION", "0.1.2")
+    version = os.environ.get("HETZNER_MCP_VERSION", "0.1.3")
     return f"hetzner-mcp/{version}"

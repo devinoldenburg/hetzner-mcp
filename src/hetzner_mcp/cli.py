@@ -152,6 +152,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     server.set_defaults(_handler=_cmd_server_run)
 
+    update = sub.add_parser(
+        "update",
+        help="Refresh specs and re-apply client integration",
+    )
+    update.set_defaults(_handler=_cmd_update)
+
     client = sub.add_parser("client", help="Manage MCP client integration")
     client_sub = client.add_subparsers(dest="client_command")
     client_install = client_sub.add_parser("install", help="Configure supported MCP clients")
@@ -233,6 +239,30 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _cmd_server_run(args: argparse.Namespace) -> int:
     asyncio.run(run_server(refresh_specs=bool(args.refresh_specs)))
+    return 0
+
+
+def _cmd_update(_: argparse.Namespace) -> int:
+    print("Update")
+
+    try:
+        registry = OperationRegistry.load(refresh_specs=True)
+    except Exception as exc:
+        print(f"- specs: refresh failed ({exc}); continuing with cached specs")
+    else:
+        counts = registry.counts_by_domain()
+        print(
+            "- specs: refreshed "
+            f"({registry.operation_count} total; "
+            f"cloud={counts['cloud']}, storage={counts['storage']})"
+        )
+
+    print("- client config:")
+    results = install_all()
+    for result in results:
+        print(f"  - {result.client}: {result.message} ({result.path})")
+
+    print("Update complete. Restart your MCP client to pick up changes.")
     return 0
 
 

@@ -190,6 +190,7 @@ hetzner-mcp install
 | `hetzner-mcp status` | Show effective runtime config + registry + client status |
 | `hetzner-mcp doctor [--json]` | Print detailed diagnostics |
 | `hetzner-mcp server run [--refresh-specs]` | Run stdio MCP server |
+| `hetzner-mcp update` | Refresh specs and re-apply client integration |
 | `hetzner-mcp client install` | Configure supported MCP clients |
 | `hetzner-mcp client status` | Show client config installation state |
 | `hetzner-mcp client repair` | Re-apply configuration entries |
