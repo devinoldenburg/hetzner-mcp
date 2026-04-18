@@ -198,6 +198,11 @@ Run:
 hetzner-mcp install
 ```
 
+OpenCode integration note:
+
+- This installer writes OpenCode MCP config to the global OpenCode config file (`opencode.jsonc`) under the `mcp` key.
+- Legacy `~/.opencode/mcp.json` is not used.
+
 ## Manual Configuration
 
 ```json

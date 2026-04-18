@@ -123,6 +123,7 @@ class _ClientTarget:
     path: Path
     root_key: str
     server_key: str
+    opencode_format: bool = False
 
 
 def _install_target(*, target: _ClientTarget, command: str) -> InstallResult:
@@ -135,10 +136,7 @@ def _install_target(*, target: _ClientTarget, command: str) -> InstallResult:
         root = {}
         config[target.root_key] = root
 
-    server_value: dict[str, Any] = {
-        "command": command,
-        "args": [],
-    }
+    server_value = _server_value_for_target(target=target, command=command)
 
     was_equal = root.get(target.server_key) == server_value
     root[target.server_key] = server_value
@@ -155,15 +153,145 @@ def _install_target(*, target: _ClientTarget, command: str) -> InstallResult:
 def _load_json(path: Path) -> dict[str, Any] | Any:
     if not path.exists():
         return {}
+
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_text(encoding="utf-8")
+        if path.suffix.lower() == ".jsonc":
+            raw = _jsonc_to_json(raw)
+        return json.loads(raw)
     except json.JSONDecodeError:
         return {}
+
+
+def _jsonc_to_json(raw: str) -> str:
+    return _strip_trailing_commas(_strip_jsonc_comments(raw))
+
+
+def _strip_jsonc_comments(raw: str) -> str:
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    in_line_comment = False
+    in_block_comment = False
+    index = 0
+    length = len(raw)
+
+    while index < length:
+        char = raw[index]
+        next_char = raw[index + 1] if index + 1 < length else ""
+
+        if in_line_comment:
+            if char == "\n":
+                in_line_comment = False
+                out.append(char)
+            index += 1
+            continue
+
+        if in_block_comment:
+            if char == "*" and next_char == "/":
+                in_block_comment = False
+                index += 2
+                continue
+            if char == "\n":
+                out.append(char)
+            index += 1
+            continue
+
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+
+        if char == "/" and next_char == "/":
+            in_line_comment = True
+            index += 2
+            continue
+
+        if char == "/" and next_char == "*":
+            in_block_comment = True
+            index += 2
+            continue
+
+        out.append(char)
+        index += 1
+
+    return "".join(out)
+
+
+def _strip_trailing_commas(raw: str) -> str:
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    length = len(raw)
+
+    while index < length:
+        char = raw[index]
+
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+
+        if char == ",":
+            lookahead = index + 1
+            while lookahead < length and raw[lookahead] in {" ", "\t", "\r", "\n"}:
+                lookahead += 1
+            if lookahead < length and raw[lookahead] in {"]", "}"}:
+                index += 1
+                continue
+
+        out.append(char)
+        index += 1
+
+    return "".join(out)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
+def _server_value_for_target(*, target: _ClientTarget, command: str) -> dict[str, Any]:
+    if target.opencode_format:
+        return {
+            "type": "local",
+            "command": [command],
+            "enabled": True,
+        }
+
+    return {
+        "command": command,
+        "args": [],
+    }
+
+
+def _opencode_global_config_path(home: Path) -> Path:
+    return home / ".config" / "opencode" / "opencode.jsonc"
 
 
 def _targets_for_platform() -> list[_ClientTarget]:
@@ -189,9 +317,10 @@ def _targets_for_platform() -> list[_ClientTarget]:
         ),
         _ClientTarget(
             client="OpenCode",
-            path=home / ".opencode" / "mcp.json",
-            root_key="mcpServers",
+            path=_opencode_global_config_path(home),
+            root_key="mcp",
             server_key="hetzner-mcp",
+            opencode_format=True,
         ),
         _ClientTarget(
             client="Cline",
