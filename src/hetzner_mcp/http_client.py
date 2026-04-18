@@ -26,7 +26,7 @@ class RuntimeConfig:
     timeout_seconds: float = 30.0
     max_retries: int = 3
     backoff_base_seconds: float = 0.5
-    user_agent: str = "hetzner-mcp/0.1.4"
+    user_agent: str = "hetzner-mcp/0.1.5"
 
     def token_for(self, api_domain: ApiDomain) -> str | None:
         if api_domain == "cloud":

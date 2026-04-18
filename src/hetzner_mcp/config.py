@@ -144,7 +144,7 @@ def load_runtime_config() -> RuntimeConfig:
             "HETZNER_MCP_USER_AGENT",
             USER_AGENT_KEY,
             effective_store,
-            default="hetzner-mcp/0.1.4",
+            default="hetzner-mcp/0.1.5",
         ),
     )
 

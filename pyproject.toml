@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hetzner-mcp"
-version = "0.1.4"
+version = "0.1.5"
 description = "Model Context Protocol server for the full Hetzner Cloud and Storage APIs."
 readme = "README.md"
 license = { text = "MIT" }

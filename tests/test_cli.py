@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import hetzner_mcp.cli as cli
+from hetzner_mcp.capabilities import DomainCapability
 from hetzner_mcp.install import InstallResult
 
 
@@ -83,6 +84,11 @@ def test_project_commands_manage_multiple_profiles(
     monkeypatch.setenv("HETZNER_MCP_CONFIG_PATH", str(tmp_path / "cfg.json"))
     monkeypatch.delenv("HETZNER_PROJECT", raising=False)
 
+    def _fake_detect(**_: object) -> list[DomainCapability]:
+        return []
+
+    monkeypatch.setattr(cli, "detect_api_key_capabilities", _fake_detect)
+
     add_prod = cli.main(
         [
             "project",
@@ -131,3 +137,47 @@ def test_project_commands_manage_multiple_profiles(
     show_payload = json.loads(show_output)
     assert show_payload["name"] == "dev"
     assert show_payload["is_active"] is True
+
+
+def test_auth_set_reports_detected_key_capabilities(
+    tmp_path: Path, monkeypatch: object, capsys: object
+) -> None:
+    monkeypatch.setenv("HETZNER_MCP_CONFIG_PATH", str(tmp_path / "cfg.json"))
+
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def _fake_detect(**kwargs: object) -> list[DomainCapability]:
+        token = str(kwargs["token"])
+        domains = tuple(str(item) for item in tuple(kwargs["domains"]))
+        calls.append((token, domains))
+
+        if domains == ("cloud", "storage"):
+            return [
+                DomainCapability(
+                    api_domain="cloud",
+                    read_access=True,
+                    write_access=True,
+                    read_status_code=200,
+                    write_status_code=422,
+                ),
+                DomainCapability(
+                    api_domain="storage",
+                    read_access=False,
+                    write_access=False,
+                    read_status_code=401,
+                    write_status_code=401,
+                ),
+            ]
+
+        return []
+
+    monkeypatch.setattr(cli, "detect_api_key_capabilities", _fake_detect)
+
+    exit_code = cli.main(["auth", "set", "--token", "my-token"])
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert calls == [("my-token", ("cloud", "storage"))]
+    assert "Token capabilities" in output
+    assert "default token: cloud:read+write" in output
+    assert "storage:no-access" in output

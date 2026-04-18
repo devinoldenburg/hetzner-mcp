@@ -130,6 +130,9 @@ Local CLI config examples:
 # set default token
 hetzner-mcp auth set --token "your_token_here"
 
+# auth set auto-probes what the provided key can do
+# (cloud/storage + read/write capability hints)
+
 # set per-domain overrides
 hetzner-mcp auth set --cloud-token "cloud_token" --storage-token "storage_token"
 
@@ -147,12 +150,20 @@ Multi-project profile examples:
 hetzner-mcp project add prod --description "Production Hetzner" --token "prod_token" --activate
 hetzner-mcp project add staging --description "Staging Hetzner" --token "staging_token"
 
+# project add also auto-detects capability hints for entered keys
+
 # see which profile is active and what each one is for
 hetzner-mcp project list
 
 # switch active profile
 hetzner-mcp project use staging
 ```
+
+Capability probing notes:
+
+- `auth set` and `project add` automatically probe entered keys and print capability hints.
+- Report format includes per-domain read/write level plus probe status codes (for example `cloud:read+write`, `storage:no-access`).
+- Detection uses safe representative `GET`/`POST` checks and is best-effort guidance, not a formal permission matrix.
 
 Config file location:
 
@@ -212,10 +223,10 @@ hetzner-mcp install
 | `hetzner-mcp client status` | Show client config installation state |
 | `hetzner-mcp client repair` | Re-apply configuration entries |
 | `hetzner-mcp client uninstall` | Remove MCP config entries |
-| `hetzner-mcp auth set ...` | Configure API keys directly from CLI |
+| `hetzner-mcp auth set ...` | Configure API keys directly from CLI and auto-detect key capabilities |
 | `hetzner-mcp auth show` | Show token status and source |
 | `hetzner-mcp auth clear [--all]` | Clear stored token entries |
-| `hetzner-mcp project add/list/show/use/remove` | Manage multiple project credential profiles |
+| `hetzner-mcp project add/list/show/use/remove` | Manage multiple project credential profiles (with capability probing on add) |
 | `hetzner-mcp config show` | Show stored + effective config |
 | `hetzner-mcp config get/set/unset <key>` | Read/write persisted config keys |
 | `hetzner-mcp config edit` | Edit persisted config file in `$EDITOR` |

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .capabilities import DomainCapability, detect_api_key_capabilities
 from .config import (
     BACKOFF_BASE_SECONDS_KEY,
     CLOUD_BASE_URL_KEY,
@@ -40,6 +41,7 @@ from .config import (
     upsert_project,
 )
 from .install import install_all, status_all, uninstall_all
+from .models import ApiDomain
 from .registry import OperationRegistry
 from .server import run_server
 
@@ -53,6 +55,15 @@ class ConfigKeySpec:
     value_type: str
     description: str
     secret: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class TokenProbeRequest:
+    """One token capability probe request from CLI input."""
+
+    label: str
+    token: str
+    domains: tuple[ApiDomain, ...]
 
 
 CONFIG_KEY_SPECS: tuple[ConfigKeySpec, ...] = (
@@ -179,7 +190,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     auth = sub.add_parser("auth", help="Manage API tokens directly from CLI")
     auth_sub = auth.add_subparsers(dest="auth_command")
-    auth_set = auth_sub.add_parser("set", help="Set or clear token values in local config")
+    auth_set = auth_sub.add_parser(
+        "set",
+        help="Set or clear token values and auto-detect token capabilities",
+    )
     auth_set.add_argument("token", nargs="?", help="Default token (same as --token)")
     auth_set.add_argument("--token", dest="default_token", help="Default token for both APIs")
     auth_set.add_argument("--cloud-token", help="Cloud API token override")
@@ -206,7 +220,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     project_sub = project.add_subparsers(dest="project_command")
 
-    project_add = project_sub.add_parser("add", help="Create or update one project profile")
+    project_add = project_sub.add_parser(
+        "add",
+        help="Create/update one project profile and detect token capabilities",
+    )
     project_add.add_argument("name", help="Project profile name")
     project_add.add_argument("--description", help="Human-friendly project description")
     project_add.add_argument("--token", help="Default token for this project")
@@ -501,16 +518,34 @@ def _cmd_auth_set(args: argparse.Namespace) -> int:
     default_token = _optional_non_empty_string(args.default_token)
     positional_token = _optional_non_empty_string(args.token)
     effective_default_token = default_token or positional_token
+    cloud_token = _optional_non_empty_string(args.cloud_token)
+    storage_token = _optional_non_empty_string(args.storage_token)
 
     updates: dict[str, Any] = {}
     removals: list[str] = []
+    probes: list[TokenProbeRequest] = []
 
     if effective_default_token is not None:
         updates[TOKEN_DEFAULT_KEY] = effective_default_token
-    if _optional_non_empty_string(args.cloud_token) is not None:
-        updates[TOKEN_CLOUD_KEY] = str(args.cloud_token).strip()
-    if _optional_non_empty_string(args.storage_token) is not None:
-        updates[TOKEN_STORAGE_KEY] = str(args.storage_token).strip()
+        probes.append(
+            TokenProbeRequest(
+                label="default token",
+                token=effective_default_token,
+                domains=("cloud", "storage"),
+            )
+        )
+    if cloud_token is not None:
+        updates[TOKEN_CLOUD_KEY] = cloud_token
+        probes.append(TokenProbeRequest(label="cloud token", token=cloud_token, domains=("cloud",)))
+    if storage_token is not None:
+        updates[TOKEN_STORAGE_KEY] = storage_token
+        probes.append(
+            TokenProbeRequest(
+                label="storage token",
+                token=storage_token,
+                domains=("storage",),
+            )
+        )
 
     if bool(args.clear_default):
         removals.append(TOKEN_DEFAULT_KEY)
@@ -533,6 +568,7 @@ def _cmd_auth_set(args: argparse.Namespace) -> int:
     save_stored_config(current)
 
     print(f"Updated auth config in {config_file_path()}")
+    _emit_token_capability_report(probes)
     return _cmd_auth_show(_namespace_with_json_false())
 
 
@@ -634,17 +670,38 @@ def _cmd_project_add(args: argparse.Namespace) -> int:
     if description is not None:
         updates[PROJECT_DESCRIPTION_KEY] = description
 
+    probes: list[TokenProbeRequest] = []
+
     token = _optional_non_empty_string(args.token)
     if token is not None:
         updates[TOKEN_DEFAULT_KEY] = token
+        probes.append(
+            TokenProbeRequest(
+                label=f"project '{name}' default token", token=token, domains=("cloud", "storage")
+            )
+        )
 
     cloud_token = _optional_non_empty_string(args.cloud_token)
     if cloud_token is not None:
         updates[TOKEN_CLOUD_KEY] = cloud_token
+        probes.append(
+            TokenProbeRequest(
+                label=f"project '{name}' cloud token",
+                token=cloud_token,
+                domains=("cloud",),
+            )
+        )
 
     storage_token = _optional_non_empty_string(args.storage_token)
     if storage_token is not None:
         updates[TOKEN_STORAGE_KEY] = storage_token
+        probes.append(
+            TokenProbeRequest(
+                label=f"project '{name}' storage token",
+                token=storage_token,
+                domains=("storage",),
+            )
+        )
 
     if not updates:
         print("No project values provided. Add token values and/or --description.")
@@ -659,6 +716,7 @@ def _cmd_project_add(args: argparse.Namespace) -> int:
     print(f"Saved project '{name}' in {config_file_path()}")
     if bool(args.activate):
         print(f"Active project set to '{name}'")
+    _emit_token_capability_report(probes)
     return _cmd_project_list(_namespace_with_json_false())
 
 
@@ -980,6 +1038,48 @@ def _project_token_flags(profile: dict[str, Any]) -> str:
     if not parts:
         return "none"
     return ",".join(parts)
+
+
+def _emit_token_capability_report(probes: list[TokenProbeRequest]) -> None:
+    if not probes:
+        return
+
+    runtime = load_runtime_config()
+    print("Token capabilities")
+    for probe in probes:
+        try:
+            capabilities = detect_api_key_capabilities(
+                token=probe.token,
+                cloud_base_url=runtime.cloud_base_url,
+                storage_base_url=runtime.storage_base_url,
+                timeout_seconds=runtime.timeout_seconds,
+                user_agent=runtime.user_agent,
+                domains=probe.domains,
+            )
+        except Exception as exc:
+            print(f"- {probe.label}: detection failed ({exc})")
+            continue
+
+        if not capabilities:
+            print(f"- {probe.label}: unknown")
+            continue
+
+        formatted = ", ".join(_format_domain_capability(item) for item in capabilities)
+        print(f"- {probe.label}: {formatted}")
+
+
+def _format_domain_capability(capability: DomainCapability) -> str:
+    return (
+        f"{capability.api_domain}:{capability.level} "
+        f"(GET {_status_label(capability.read_status_code)}, "
+        f"POST {_status_label(capability.write_status_code)})"
+    )
+
+
+def _status_label(status_code: int) -> str:
+    if status_code == 0:
+        return "network-error"
+    return str(status_code)
 
 
 def _project_agent_message(*, selection: dict[str, Any], profiles: list[dict[str, Any]]) -> str:
