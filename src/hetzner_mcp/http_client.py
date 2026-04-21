@@ -11,6 +11,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from . import __version__
 from .models import ApiDomain, HttpResult, OperationSpec
 
 
@@ -26,7 +27,7 @@ class RuntimeConfig:
     timeout_seconds: float = 30.0
     max_retries: int = 3
     backoff_base_seconds: float = 0.5
-    user_agent: str = "hetzner-mcp/0.1.6"
+    user_agent: str = f"hetzner-mcp/{__version__}"
 
     def token_for(self, api_domain: ApiDomain) -> str | None:
         if api_domain == "cloud":
@@ -164,7 +165,8 @@ class HetznerHttpClient:
         data: Any = None
 
         try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
+            # URL targets are pre-validated in config before any bearer token reaches urlopen.
+            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:  # nosec B310
                 status_code = int(response.getcode())
                 response_headers = {k: v for k, v in response.headers.items()}
                 raw_bytes = response.read()

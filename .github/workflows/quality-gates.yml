@@ -39,7 +39,7 @@ jobs:
 
       - name: Security scan with Bandit
         run: |
-          bandit -r src/hetzner_mcp/ -ll -s B310
+          bandit -r src/hetzner_mcp/ -ll
 
       - name: Run unit tests
         run: |

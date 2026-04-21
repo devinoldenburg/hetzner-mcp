@@ -15,9 +15,16 @@ import mcp.server.stdio
 from mcp import types
 from mcp.server import Server
 
-from .config import get_project_selection, load_runtime_config, project_profiles, set_active_project
+from . import __version__
+from .config import (
+    get_project_selection,
+    load_runtime_config,
+    load_runtime_config_for_project,
+    project_profiles,
+    set_active_project,
+)
 from .errors import HetznerMCPError, ValidationError
-from .http_client import HetznerHttpClient
+from .http_client import HetznerHttpClient, RuntimeConfig
 from .models import CategorySpec, OperationSpec
 from .registry import OperationRegistry
 from .request_builder import build_request
@@ -45,6 +52,7 @@ class SessionUsageState:
 
     event_counter: int = 0
     operations: dict[str, OperationUsageState] = field(default_factory=dict)
+    project_override: str | None = None
 
 
 def _configure_logging() -> None:
@@ -157,8 +165,8 @@ class HetznerMCPApplication:
             types.Tool(
                 name="set_active_api_project",
                 description=(
-                    "Set the active API project profile for this server runtime and persisted "
-                    "local config."
+                    "Set the active API project profile for this MCP session. Persist to local "
+                    "config only when explicitly requested."
                 ),
                 inputSchema={
                     "type": "object",
@@ -166,7 +174,12 @@ class HetznerMCPApplication:
                         "project": {
                             "type": "string",
                             "description": "Configured project profile name",
-                        }
+                        },
+                        "persist": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Also save this selection to local config",
+                        },
                     },
                     "required": ["project"],
                     "additionalProperties": False,
@@ -283,13 +296,16 @@ class HetznerMCPApplication:
                 payload = self._helper_get_category_details(arguments)
                 return _success_result(payload)
             if name == "list_api_projects":
-                payload = self._helper_list_projects(arguments)
+                payload = self._helper_list_projects(arguments, session_key=normalized_session)
                 return _success_result(payload)
             if name == "set_active_api_project":
-                payload = self._helper_set_active_project(arguments)
+                payload = self._helper_set_active_project(arguments, session_key=normalized_session)
                 return _success_result(payload)
             if name == "wait_for_action":
-                payload = await self._helper_wait_for_action(arguments)
+                payload = await self._helper_wait_for_action(
+                    arguments,
+                    session_key=normalized_session,
+                )
                 return _success_result(payload)
 
             if name.startswith(GUIDE_PREFIX):
@@ -313,7 +329,11 @@ class HetznerMCPApplication:
                 operation_id=operation.operation_id,
                 event_id=event_id,
             )
-            result = await self._execute_operation(operation=operation, arguments=arguments)
+            result = await self._execute_operation(
+                operation=operation,
+                arguments=arguments,
+                session_key=normalized_session,
+            )
             if not result.isError:
                 self._mark_operation_executed(
                     session_key=normalized_session,
@@ -494,27 +514,47 @@ class HetznerMCPApplication:
         category = self.registry.get_category(category_id)
         return self._build_category_guide(category)
 
-    def _helper_list_projects(self, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    def _helper_list_projects(
+        self,
+        arguments: dict[str, Any] | None,
+        *,
+        session_key: str | None = None,
+    ) -> dict[str, Any]:
         args = arguments or {}
         if not isinstance(args, dict):
             raise ValidationError(code="invalid_arguments", message="Arguments must be an object")
 
+        normalized_session = self._normalize_session_key(session_key)
+        session_state = self.session_usage.get(normalized_session)
+        session_project = session_state.project_override if session_state else None
         profiles = project_profiles()
-        selection = get_project_selection()
+        selection = get_project_selection(project_override=session_project)
         agent_message = _project_agent_message_for_server(selection=selection, profiles=profiles)
+        session_projects = {
+            key: state.project_override
+            for key, state in self.session_usage.items()
+            if state.project_override is not None
+        }
         return {
             "active_project": {
                 "name": selection.get("name"),
                 "source": selection.get("source"),
                 "exists": selection.get("exists"),
             },
+            "session_project": session_project,
+            "session_overrides": session_projects,
             "available_projects": [profile["name"] for profile in profiles],
             "projects": profiles,
             "message_for_agent": agent_message,
             "selection_message": selection.get("message"),
         }
 
-    def _helper_set_active_project(self, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    def _helper_set_active_project(
+        self,
+        arguments: dict[str, Any] | None,
+        *,
+        session_key: str,
+    ) -> dict[str, Any]:
         args = arguments or {}
         if not isinstance(args, dict):
             raise ValidationError(code="invalid_arguments", message="Arguments must be an object")
@@ -522,6 +562,7 @@ class HetznerMCPApplication:
         project = args.get("project")
         if not isinstance(project, str) or not project.strip():
             raise ValidationError(code="missing_project", message="project is required")
+        persist = bool(args.get("persist", False))
 
         profiles = project_profiles()
         available = {profile["name"] for profile in profiles}
@@ -532,14 +573,26 @@ class HetznerMCPApplication:
                 details={"available_projects": sorted(available)},
             )
 
-        set_active_project(project)
-        self.client.config = load_runtime_config()
+        session_state = self.session_usage.setdefault(session_key, SessionUsageState())
+        session_state.project_override = project
+        if persist:
+            set_active_project(project)
 
-        payload = self._helper_list_projects({})
+        self.client.config = load_runtime_config_for_project(session_state.project_override)
+
+        payload = self._helper_list_projects({}, session_key=session_key)
         payload["updated"] = True
+        payload["persisted"] = persist
+        payload["session_project"] = project
+        persistence_note = (
+            "The selection was also written to local config."
+            if persist
+            else "Local config was left unchanged."
+        )
         payload["message"] = (
-            f"Active project switched to '{project}'. New API calls now use this project's "
-            "credentials unless overridden by environment variables."
+            f"Active project switched to '{project}' for session '{session_key}'. "
+            "New API calls now use this project's credentials unless overridden by environment "
+            f"variables. {persistence_note}"
         )
         return payload
 
@@ -683,7 +736,18 @@ class HetznerMCPApplication:
     def _normalize_session_key(self, session_key: str | None) -> str:
         return session_key or "global"
 
-    async def _helper_wait_for_action(self, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    def _runtime_config_for_session(self, session_key: str | None) -> RuntimeConfig:
+        normalized_session = self._normalize_session_key(session_key)
+        session_state = self.session_usage.get(normalized_session)
+        project_override = session_state.project_override if session_state else None
+        return load_runtime_config_for_project(project_override)
+
+    async def _helper_wait_for_action(
+        self,
+        arguments: dict[str, Any] | None,
+        *,
+        session_key: str | None,
+    ) -> dict[str, Any]:
         args = arguments or {}
         if not isinstance(args, dict):
             raise ValidationError(code="invalid_arguments", message="Arguments must be an object")
@@ -713,6 +777,7 @@ class HetznerMCPApplication:
                 arguments={
                     "path": {"id": action_id},
                 },
+                session_key=session_key,
             )
             structured = step_result.structuredContent or {}
             history.append(structured)
@@ -758,8 +823,11 @@ class HetznerMCPApplication:
         *,
         operation: OperationSpec,
         arguments: dict[str, Any] | None,
+        session_key: str | None = None,
     ) -> types.CallToolResult:
         request = build_request(operation, arguments)
+        runtime_config = self._runtime_config_for_session(session_key)
+        self.client.config = runtime_config
 
         result = await asyncio.to_thread(
             self.client.execute,
@@ -772,16 +840,15 @@ class HetznerMCPApplication:
         payload = {
             "operation": _operation_summary(operation),
             "request": {
-                "url": result.request_url,
                 "method": operation.method,
                 "retries": result.retries,
                 "path": request.path_params,
                 "query": request.query_params,
-                "body": request.body,
+                "body": _redact_value(request.body),
             },
+            "request_url": result.request_url,
             "status_code": result.status_code,
-            "headers": result.headers,
-            "response": result.data if result.data is not None else result.raw_text,
+            "response": _redact_value(result.data if result.data is not None else result.raw_text),
         }
 
         if result.ok:
@@ -832,7 +899,7 @@ def _operation_input_schema(operation: OperationSpec) -> dict[str, Any]:
         query_schema: dict[str, Any] = {
             "type": "object",
             "properties": query_props,
-            "additionalProperties": True,
+            "additionalProperties": False,
         }
         if query_required:
             query_schema["required"] = query_required
@@ -1032,7 +1099,7 @@ def _project_agent_message_for_server(
                 return (
                     f"Active project is '{selected}' ({description}). "
                     "Use set_active_api_project to switch when your task targets a different "
-                    "environment."
+                    "environment. Add persist=true only if you want to write that choice to disk."
                 )
 
     if isinstance(selected, str) and source == "env":
@@ -1071,6 +1138,45 @@ def _normalize_api_error(*, result_data: Any, status_code: int) -> dict[str, Any
         "message": f"Hetzner API request failed with status {status_code}",
         "status_code": status_code,
     }
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if _is_sensitive_key(key_text):
+                out[key_text] = "<redacted>"
+            else:
+                out[key_text] = _redact_value(item)
+        return out
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_value(item) for item in value]
+    return value
+
+
+def _is_sensitive_key(key: str) -> bool:
+    lowered = key.lower().replace("-", "_")
+    sensitive_fragments = (
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "private_key",
+        "privatekey",
+        "api_key",
+        "apikey",
+        "access_key",
+        "ssh_key",
+        "sshkey",
+        "authorization",
+        "credential",
+        "one_time",
+        "otp",
+    )
+    return any(fragment in lowered for fragment in sensitive_fragments)
 
 
 def _success_result(payload: dict[str, Any]) -> types.CallToolResult:
@@ -1133,7 +1239,7 @@ def create_server(*, refresh_specs: bool = False) -> Server[Any]:
 
     server: Server[Any] = Server(
         name="hetzner-mcp",
-        version="0.1.6",
+        version=__version__,
         instructions=(
             "Hetzner MCP server with full Cloud + Storage API coverage. "
             "Use list_api_operations/search_api_operations to discover operations, "

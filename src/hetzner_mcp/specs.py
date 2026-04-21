@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .errors import SpecLoadError
 
 CLOUD_SPEC_URL = "https://docs.hetzner.cloud/cloud.spec.json"
@@ -87,7 +88,8 @@ def _fetch_json(*, url: str, timeout_seconds: float) -> dict[str, Any]:
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        # Spec downloads use fixed HTTPS Hetzner URLs, so this urlopen call is intentionally scoped.
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:  # nosec B310
             raw_bytes = response.read()
     except urllib.error.HTTPError as exc:
         raise SpecLoadError(
@@ -263,5 +265,5 @@ def _resolve_local_ref(*, ref: str, spec: dict[str, Any]) -> Any:
 
 
 def _user_agent() -> str:
-    version = os.environ.get("HETZNER_MCP_VERSION", "0.1.6")
+    version = os.environ.get("HETZNER_MCP_VERSION", __version__)
     return f"hetzner-mcp/{version}"

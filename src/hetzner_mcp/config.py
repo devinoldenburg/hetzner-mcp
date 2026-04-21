@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.parse
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import __version__
+from .errors import ValidationError
 from .http_client import RuntimeConfig
+from .models import ApiDomain
 
 HETZNER_MCP_CONFIG_PATH_ENV = "HETZNER_MCP_CONFIG_PATH"
 HETZNER_PROJECT_ENV = "HETZNER_PROJECT"
+HETZNER_ALLOW_CUSTOM_BASE_URLS_ENV = "HETZNER_ALLOW_CUSTOM_BASE_URLS"
 
 TOKEN_DEFAULT_KEY = "token_default"
 TOKEN_CLOUD_KEY = "token_cloud"
@@ -27,6 +32,14 @@ USER_AGENT_KEY = "user_agent"
 PROJECTS_KEY = "projects"
 ACTIVE_PROJECT_KEY = "active_project"
 PROJECT_DESCRIPTION_KEY = "description"
+
+DEFAULT_CLOUD_BASE_URL = "https://api.hetzner.cloud/v1"
+DEFAULT_STORAGE_BASE_URL = "https://api.hetzner.com/v1"
+
+_DEFAULT_BASE_URLS: dict[ApiDomain, str] = {
+    "cloud": DEFAULT_CLOUD_BASE_URL,
+    "storage": DEFAULT_STORAGE_BASE_URL,
+}
 
 RUNTIME_SETTING_KEYS: tuple[str, ...] = (
     TOKEN_DEFAULT_KEY,
@@ -86,15 +99,23 @@ def load_runtime_config() -> RuntimeConfig:
 
     Environment variables take precedence over local file values.
     """
-    stored = load_stored_config()
-    selection = get_project_selection(stored)
+    return _load_runtime_config(project_override=None, stored=None)
+
+
+def _load_runtime_config(
+    *,
+    project_override: str | None,
+    stored: Mapping[str, Any] | None,
+) -> RuntimeConfig:
+    stored_config = _ensure_stored(stored)
+    selection = get_project_selection(stored_config, project_override=project_override)
     selected_project = selection["name"]
     project_values: dict[str, Any] = {}
-    projects = list_projects(stored)
+    projects = list_projects(stored_config)
     if isinstance(selected_project, str) and selected_project in projects:
         project_values = projects[selected_project]
 
-    effective_store = _effective_store(stored, project_values)
+    effective_store = _effective_store(stored_config, project_values)
 
     timeout_seconds = _float_from_env_or_store(
         "HETZNER_TIMEOUT_SECONDS",
@@ -115,6 +136,25 @@ def load_runtime_config() -> RuntimeConfig:
         default=0.5,
     )
 
+    cloud_base_url = validate_base_url(
+        _string_from_env_or_store(
+            "HETZNER_CLOUD_BASE_URL",
+            CLOUD_BASE_URL_KEY,
+            effective_store,
+            default=DEFAULT_CLOUD_BASE_URL,
+        ),
+        api_domain="cloud",
+    )
+    storage_base_url = validate_base_url(
+        _string_from_env_or_store(
+            "HETZNER_STORAGE_BASE_URL",
+            STORAGE_BASE_URL_KEY,
+            effective_store,
+            default=DEFAULT_STORAGE_BASE_URL,
+        ),
+        api_domain="storage",
+    )
+
     return RuntimeConfig(
         token_default=_optional_string_from_env_or_store(
             "HETZNER_TOKEN", TOKEN_DEFAULT_KEY, effective_store
@@ -125,18 +165,8 @@ def load_runtime_config() -> RuntimeConfig:
         token_storage=_optional_string_from_env_or_store(
             "HETZNER_STORAGE_TOKEN", TOKEN_STORAGE_KEY, effective_store
         ),
-        cloud_base_url=_string_from_env_or_store(
-            "HETZNER_CLOUD_BASE_URL",
-            CLOUD_BASE_URL_KEY,
-            effective_store,
-            default="https://api.hetzner.cloud/v1",
-        ),
-        storage_base_url=_string_from_env_or_store(
-            "HETZNER_STORAGE_BASE_URL",
-            STORAGE_BASE_URL_KEY,
-            effective_store,
-            default="https://api.hetzner.com/v1",
-        ),
+        cloud_base_url=cloud_base_url,
+        storage_base_url=storage_base_url,
         timeout_seconds=timeout_seconds,
         max_retries=max(0, max_retries),
         backoff_base_seconds=max(0.05, backoff_base),
@@ -144,9 +174,94 @@ def load_runtime_config() -> RuntimeConfig:
             "HETZNER_MCP_USER_AGENT",
             USER_AGENT_KEY,
             effective_store,
-            default="hetzner-mcp/0.1.6",
+            default=f"hetzner-mcp/{__version__}",
         ),
     )
+
+
+def load_runtime_config_for_project(
+    project_override: str | None,
+    *,
+    stored: Mapping[str, Any] | None = None,
+) -> RuntimeConfig:
+    """Load runtime config for one session-scoped project override."""
+    return _load_runtime_config(project_override=project_override, stored=stored)
+
+
+def allow_custom_base_urls() -> bool:
+    """Return whether custom HTTPS base URLs are explicitly allowed."""
+    raw = os.environ.get(HETZNER_ALLOW_CUSTOM_BASE_URLS_ENV, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def validate_base_url(
+    value: str,
+    *,
+    api_domain: ApiDomain,
+    allow_custom: bool | None = None,
+) -> str:
+    """Validate one configured API base URL before tokens are ever attached to it."""
+    parsed = urllib.parse.urlparse(value)
+    label = f"{api_domain} base URL"
+
+    if parsed.scheme != "https":
+        raise ValidationError(
+            code="invalid_base_url",
+            message=f"{label} must use https",
+            details={"api_domain": api_domain, "value": value},
+        )
+    if not parsed.netloc:
+        raise ValidationError(
+            code="invalid_base_url",
+            message=f"{label} must include a hostname",
+            details={"api_domain": api_domain, "value": value},
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise ValidationError(
+            code="invalid_base_url",
+            message=f"{label} must not include embedded credentials",
+            details={"api_domain": api_domain, "value": value},
+        )
+    if parsed.query or parsed.fragment:
+        raise ValidationError(
+            code="invalid_base_url",
+            message=f"{label} must not include query strings or fragments",
+            details={"api_domain": api_domain, "value": value},
+        )
+
+    normalized_path = parsed.path.rstrip("/") or ""
+    normalized = urllib.parse.urlunparse(
+        (parsed.scheme, parsed.netloc, normalized_path, "", "", "")
+    )
+
+    custom_allowed = allow_custom_base_urls() if allow_custom is None else allow_custom
+    if custom_allowed:
+        return normalized
+
+    expected = urllib.parse.urlparse(_DEFAULT_BASE_URLS[api_domain])
+    expected_path = expected.path.rstrip("/") or ""
+    expected_port = expected.port
+    actual_port = parsed.port
+
+    if (
+        parsed.hostname != expected.hostname
+        or actual_port != expected_port
+        or normalized_path != expected_path
+    ):
+        raise ValidationError(
+            code="custom_base_url_disabled",
+            message=(
+                f"{label} must use the official Hetzner endpoint {_DEFAULT_BASE_URLS[api_domain]}. "
+                f"Set {HETZNER_ALLOW_CUSTOM_BASE_URLS_ENV}=true to opt into custom HTTPS base URLs."
+            ),
+            details={
+                "api_domain": api_domain,
+                "value": value,
+                "expected": _DEFAULT_BASE_URLS[api_domain],
+            },
+        )
+
+    return normalized
 
 
 def config_file_path() -> Path:
@@ -253,13 +368,21 @@ def project_profiles(stored: Mapping[str, Any] | None = None) -> list[dict[str, 
     return out
 
 
-def get_project_selection(stored: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def get_project_selection(
+    stored: Mapping[str, Any] | None = None,
+    *,
+    project_override: str | None = None,
+) -> dict[str, Any]:
     """Return selected project routing details for runtime and agent guidance."""
     config = _ensure_stored(stored)
     projects = list_projects(config)
 
     selected = _optional_string(os.environ.get(HETZNER_PROJECT_ENV))
     source = "env" if selected else "unset"
+    if selected is None:
+        selected = _normalize_project_name(project_override)
+        if selected is not None:
+            source = "session"
     if selected is None:
         selected = _optional_string(config.get(ACTIVE_PROJECT_KEY))
         if selected is not None:
@@ -274,13 +397,19 @@ def get_project_selection(stored: Mapping[str, Any] | None = None) -> dict[str, 
         message = "No project profile selected. Using global tokens/config values."
     elif exists:
         description_suffix = f" ({description})" if description else ""
+        selection_scope = "Session override" if source == "session" else "Active project"
         message = (
-            f"Active project '{selected}'{description_suffix}. API calls use this project's "
+            f"{selection_scope} '{selected}'{description_suffix}. API calls use this project's "
             "credentials unless overridden by environment variables."
         )
     elif source == "env":
         message = (
             f"HETZNER_PROJECT='{selected}' does not match any configured project profile. "
+            "Falling back to global tokens/config values."
+        )
+    elif source == "session":
+        message = (
+            f"Session override project '{selected}' was not found. "
             "Falling back to global tokens/config values."
         )
     else:

@@ -2,8 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from hetzner_mcp.config import (
     ACTIVE_PROJECT_KEY,
+    DEFAULT_CLOUD_BASE_URL,
+    DEFAULT_STORAGE_BASE_URL,
+    HETZNER_ALLOW_CUSTOM_BASE_URLS_ENV,
     HETZNER_PROJECT_ENV,
     PROJECTS_KEY,
     TOKEN_CLOUD_KEY,
@@ -12,13 +17,16 @@ from hetzner_mcp.config import (
     config_file_path,
     get_project_selection,
     load_runtime_config,
+    load_runtime_config_for_project,
     load_stored_config,
     project_profiles,
     save_stored_config,
     set_active_project,
     unset_stored_config_keys,
     upsert_project,
+    validate_base_url,
 )
+from hetzner_mcp.errors import ValidationError
 
 
 def _clear_runtime_env(monkeypatch: object) -> None:
@@ -41,6 +49,7 @@ def _clear_runtime_env(monkeypatch: object) -> None:
 def test_runtime_config_loads_values_from_local_config(tmp_path: Path, monkeypatch: object) -> None:
     monkeypatch.setenv("HETZNER_MCP_CONFIG_PATH", str(tmp_path / "cfg.json"))
     _clear_runtime_env(monkeypatch)
+    monkeypatch.setenv(HETZNER_ALLOW_CUSTOM_BASE_URLS_ENV, "true")
 
     save_stored_config(
         {
@@ -62,6 +71,15 @@ def test_runtime_config_loads_values_from_local_config(tmp_path: Path, monkeypat
     assert cfg.max_retries == 9
     assert cfg.backoff_base_seconds == 0.7
     assert cfg.user_agent == "hetzner-mcp/test"
+
+
+def test_runtime_config_uses_official_defaults(tmp_path: Path, monkeypatch: object) -> None:
+    monkeypatch.setenv("HETZNER_MCP_CONFIG_PATH", str(tmp_path / "cfg.json"))
+    _clear_runtime_env(monkeypatch)
+
+    cfg = load_runtime_config()
+    assert cfg.cloud_base_url == DEFAULT_CLOUD_BASE_URL
+    assert cfg.storage_base_url == DEFAULT_STORAGE_BASE_URL
 
 
 def test_runtime_config_prefers_environment_over_local_config(
@@ -166,3 +184,68 @@ def test_project_profile_helpers_create_and_select_profiles(
     set_active_project(None)
     selection = get_project_selection()
     assert selection["name"] is None
+
+
+def test_runtime_config_rejects_unapproved_custom_base_urls(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.setenv("HETZNER_MCP_CONFIG_PATH", str(tmp_path / "cfg.json"))
+    _clear_runtime_env(monkeypatch)
+
+    save_stored_config({"cloud_base_url": "https://example.invalid/v1"})
+
+    with pytest.raises(ValidationError) as exc_info:
+        load_runtime_config()
+    assert exc_info.value.code == "custom_base_url_disabled"
+
+
+def test_runtime_config_accepts_custom_base_urls_with_explicit_opt_in(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.setenv("HETZNER_MCP_CONFIG_PATH", str(tmp_path / "cfg.json"))
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setenv(HETZNER_ALLOW_CUSTOM_BASE_URLS_ENV, "true")
+
+    save_stored_config(
+        {
+            "cloud_base_url": "https://custom.example/v1/",
+            "storage_base_url": "https://storage.example/v1",
+        }
+    )
+
+    cfg = load_runtime_config()
+    assert cfg.cloud_base_url == "https://custom.example/v1"
+    assert cfg.storage_base_url == "https://storage.example/v1"
+
+
+def test_load_runtime_config_for_project_uses_session_override(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.setenv("HETZNER_MCP_CONFIG_PATH", str(tmp_path / "cfg.json"))
+    _clear_runtime_env(monkeypatch)
+
+    save_stored_config(
+        {
+            TOKEN_DEFAULT_KEY: "global-token",
+            PROJECTS_KEY: {
+                "prod": {TOKEN_DEFAULT_KEY: "prod-token"},
+                "stage": {TOKEN_DEFAULT_KEY: "stage-token"},
+            },
+            ACTIVE_PROJECT_KEY: "prod",
+        }
+    )
+
+    cfg = load_runtime_config_for_project("stage")
+    assert cfg.token_default == "stage-token"
+
+
+def test_validate_base_url_rejects_http() -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        validate_base_url("http://api.hetzner.cloud/v1", api_domain="cloud")
+    assert exc_info.value.code == "invalid_base_url"
+
+
+def test_validate_base_url_rejects_embedded_credentials() -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        validate_base_url("https://user:pass@api.hetzner.cloud/v1", api_domain="cloud")
+    assert exc_info.value.code == "invalid_base_url"

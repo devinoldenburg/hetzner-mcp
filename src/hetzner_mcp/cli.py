@@ -39,7 +39,9 @@ from .config import (
     save_stored_config,
     set_active_project,
     upsert_project,
+    validate_base_url,
 )
+from .errors import ValidationError
 from .install import install_all, status_all, uninstall_all
 from .models import ApiDomain
 from .registry import OperationRegistry
@@ -973,6 +975,16 @@ def _parse_config_value(spec: ConfigKeySpec, raw: str) -> Any:
     if spec.value_type == "string":
         if not value:
             raise SystemExit(f"{spec.cli_key} cannot be empty")
+        if spec.storage_key == CLOUD_BASE_URL_KEY:
+            try:
+                return validate_base_url(value, api_domain="cloud")
+            except ValidationError as exc:
+                raise SystemExit(str(exc)) from exc
+        if spec.storage_key == STORAGE_BASE_URL_KEY:
+            try:
+                return validate_base_url(value, api_domain="storage")
+            except ValidationError as exc:
+                raise SystemExit(str(exc)) from exc
         return value
     if spec.value_type == "int":
         try:
@@ -1100,7 +1112,8 @@ def _project_agent_message(*, selection: dict[str, Any], profiles: list[dict[str
                 return (
                     f"Use project '{selected}' for {description}. "
                     "Switch project with 'hetzner-mcp project use <name>' or set "
-                    f"{HETZNER_PROJECT_ENV}=<name> for one session."
+                    f"{HETZNER_PROJECT_ENV}=<name> for one session. "
+                    "MCP-side session switching is temporary unless persist=true is requested."
                 )
 
     if isinstance(selected, str) and source == "env":

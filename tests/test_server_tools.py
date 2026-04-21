@@ -15,6 +15,8 @@ from hetzner_mcp.server import (
 
 @dataclass
 class _DummyClient:
+    config: object | None = None
+
     def execute(
         self,
         *,
@@ -26,12 +28,13 @@ class _DummyClient:
         return HttpResult(
             ok=True,
             status_code=200,
-            headers={},
+            headers={"Authorization": "Bearer super-secret"},
             data={
                 "operation": operation.operation_id,
                 "path_params": path_params,
                 "query_params": query_params,
                 "body": body,
+                "password": "secret-password",
             },
             raw_text="",
             request_url="https://example.invalid/request",
@@ -329,3 +332,116 @@ def test_list_api_projects_helper_returns_agent_context() -> None:
     assert "active_project" in result.structuredContent
     assert "projects" in result.structuredContent
     assert "message_for_agent" in result.structuredContent
+
+
+def test_operation_response_redacts_sensitive_values() -> None:
+    app = _app()
+    unlock = asyncio.run(
+        app.call_tool(name="guide_get_action", arguments={}, session_key="session-a")
+    )
+    assert unlock.isError is False
+
+    result = asyncio.run(
+        app.call_tool(
+            name="get_action",
+            arguments={"path": {"id": 123}},
+            session_key="session-a",
+        )
+    )
+
+    assert result.isError is False
+    assert result.structuredContent is not None
+    response = result.structuredContent["response"]
+    assert response["password"] == "<redacted>"
+    assert "headers" not in result.structuredContent
+
+
+def test_operation_response_redacts_additional_secret_patterns() -> None:
+    app = _app()
+    unlock = asyncio.run(
+        app.call_tool(name="guide_get_action", arguments={}, session_key="session-extra-redact")
+    )
+    assert unlock.isError is False
+
+    app.client.execute = lambda **kwargs: HttpResult(  # type: ignore[method-assign]
+        ok=True,
+        status_code=200,
+        headers={},
+        data={
+            "access_key": "secret-a",
+            "ssh_key": "secret-b",
+            "otp": "123456",
+            "nested": {"x-api-key": "secret-c", "token": "secret-d"},
+        },
+        raw_text="",
+        request_url="https://example.invalid/request",
+        retries=0,
+    )
+
+    result = asyncio.run(
+        app.call_tool(
+            name="get_action",
+            arguments={"path": {"id": 123}},
+            session_key="session-extra-redact",
+        )
+    )
+
+    assert result.isError is False
+    assert result.structuredContent is not None
+    response = result.structuredContent["response"]
+    assert response["access_key"] == "<redacted>"
+    assert response["ssh_key"] == "<redacted>"
+    assert response["otp"] == "<redacted>"
+    assert response["nested"]["x-api-key"] == "<redacted>"
+    assert response["nested"]["token"] == "<redacted>"
+
+
+def test_set_active_api_project_is_session_only_by_default(
+    tmp_path: Any,
+    monkeypatch: object,
+) -> None:
+    from hetzner_mcp import config as config_module
+
+    monkeypatch.setenv("HETZNER_MCP_CONFIG_PATH", str(tmp_path / "cfg.json"))
+    config_module.upsert_project("prod", {"token_default": "prod-token"}, activate=True)
+    config_module.upsert_project("stage", {"token_default": "stage-token"})
+
+    app = _app()
+    result = asyncio.run(
+        app.call_tool(
+            name="set_active_api_project",
+            arguments={"project": "stage"},
+            session_key="session-a",
+        )
+    )
+
+    assert result.isError is False
+    assert result.structuredContent is not None
+    assert result.structuredContent["persisted"] is False
+    assert result.structuredContent["active_project"]["name"] == "stage"
+    assert config_module.get_project_selection()["name"] == "prod"
+
+
+def test_set_active_api_project_persist_true_updates_config(
+    tmp_path: Any,
+    monkeypatch: object,
+) -> None:
+    from hetzner_mcp import config as config_module
+
+    monkeypatch.setenv("HETZNER_MCP_CONFIG_PATH", str(tmp_path / "cfg.json"))
+    config_module.upsert_project("prod", {"token_default": "prod-token"}, activate=True)
+    config_module.upsert_project("stage", {"token_default": "stage-token"})
+
+    app = _app()
+    result = asyncio.run(
+        app.call_tool(
+            name="set_active_api_project",
+            arguments={"project": "stage", "persist": True},
+            session_key="session-a",
+        )
+    )
+
+    assert result.isError is False
+    assert result.structuredContent is not None
+    assert result.structuredContent["persisted"] is True
+    assert config_module.get_project_selection()["name"] == "stage"

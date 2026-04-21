@@ -181,3 +181,18 @@ def test_auth_set_reports_detected_key_capabilities(
     assert "Token capabilities" in output
     assert "default token: cloud:read+write" in output
     assert "storage:no-access" in output
+
+
+def test_config_set_rejects_unapproved_custom_base_url(
+    tmp_path: Path, monkeypatch: object, capsys: object
+) -> None:
+    monkeypatch.setenv("HETZNER_MCP_CONFIG_PATH", str(tmp_path / "cfg.json"))
+
+    try:
+        cli.main(["config", "set", "cloud-base-url", "https://proxy.example/v1"])
+    except SystemExit as exc:
+        assert "custom_base_url_disabled" in str(exc)
+    else:
+        raise AssertionError("expected config set to reject custom base URL")
+
+    _ = capsys.readouterr()

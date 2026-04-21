@@ -124,6 +124,13 @@ Environment variables (highest precedence):
 - `HETZNER_STORAGE_TOKEN` to override storage auth token
 - `HETZNER_PROJECT` to choose one configured local project profile for this session
 
+Base URL safety:
+
+- Default API targets are locked to the official Hetzner HTTPS endpoints.
+- `HETZNER_CLOUD_BASE_URL` and `HETZNER_STORAGE_BASE_URL` are validated before any token is attached.
+- Custom base URLs are blocked by default to prevent credential exfiltration to non-Hetzner hosts.
+- For controlled test environments only, opt in explicitly with `HETZNER_ALLOW_CUSTOM_BASE_URLS=true`.
+
 Local CLI config examples:
 
 ```bash
@@ -260,7 +267,11 @@ python scripts/verify_operation_coverage.py
 ## Security Notes
 
 - Never commit API tokens.
-- Tokens are read from environment variables.
+- Tokens can be read from environment variables or persisted local config, but outbound API targets are validated before Authorization headers are sent.
+- Official Hetzner HTTPS base URLs are enforced by default; custom base URLs require explicit opt-in with `HETZNER_ALLOW_CUSTOM_BASE_URLS=true`.
+- Dynamic endpoint calls now validate path, query, and JSON body inputs against the loaded OpenAPI schema before making HTTP requests.
+- MCP tool responses redact common secret fields such as `token`, `password`, `secret`, and `authorization` to avoid leaking credentials into transcripts.
+- `set_active_api_project` now switches the active project for the current MCP session by default; use `persist=true` only when you intentionally want to update local config.
 - Server logs are routed to stderr to keep stdio JSON-RPC clean.
 - Network retries are limited and capped.
 

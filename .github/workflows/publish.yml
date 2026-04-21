@@ -34,7 +34,7 @@ jobs:
         run: mypy src
 
       - name: Security scan with Bandit
-        run: bandit -r src/hetzner_mcp/ -ll -s B310
+        run: bandit -r src/hetzner_mcp/ -ll
 
       - name: Run all tests
         run: pytest tests/ -v --tb=short
